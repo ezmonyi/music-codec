@@ -1,0 +1,6 @@
+[submodule "MuQ"]
+	path = MuQ
+	url = https://github.com/tencent-ailab/MuQ.git
+[submodule "whisper"]
+	path = whisper
+	url = https://github.com/openai/whisper.git
