@@ -19,7 +19,7 @@ flowchart TD
         WLR -->|"(B,750,1024)"| CAT
         MID -->|"(B,750,1024)"| CAT
 
-        CAT --> INPROJ["in_proj Linear\n3328 to 256"]
+        CAT --> INPROJ["in_proj MLP\n3328 to 256 (or Linear if no hidden_dims)"]
         INPROJ --> VQ["VQ codebook lookup\ncodebook_size=8192\nstraight-through"]
         VQ -->|"codes (B,750)"| CODES["Discrete Tokens\nfor LM target"]
         VQ -->|"z_q_st (B,750,256)"| CFM
@@ -38,11 +38,11 @@ flowchart TD
 
 ## 关键设计决策
 
-- **先 Concat 再 VQ**: 3 路特征各自 resample 到 25Hz 后，在特征维度 concat 成 (B, 750, 3328)，经 `in_proj` 压缩到 256 维，由单个 VQ 量化。每帧只产生一个 token，最适合作为语言模型的生成目标
-- **VQ codebook 输出直通 CFM**: VQ 的 256 维 codebook embedding (经 straight-through) 直接作为 `FlowMatchingTransformer` 的 `cond_code` 输入。CFM 内部的 `cond_emb = nn.Linear(256, 1024)` 完成投影，`resampling_layers` (ConvTranspose1d stride=2) 完成 25Hz→50Hz 上采样。**无需额外的 out_proj 或 cond_proj**
-- **VQ 端到端训练**: 重建梯度通过 CFM → straight-through estimator → in_proj 反传，VQ codebook 同时受 commitment loss 和重建 loss 驱动
-- **无 Prompt 机制**: codec 重建不需要参考音频 prompt。原 SoulX-Singer 的 prompt 逻辑已移除，CFG dropout 保留用于推理引导
-- **从 codes 推理**: `codes → vq.codebook(codes)` 得到 256 维向量 → 传给 CFM 的 `reverse_diffusion`
+- **先 Concat 再 VQ / RVQ**: 3 路特征各自 resample 到 25Hz 后，在特征维度 concat 成 (B, 750, 3328)，经 `in_proj` 压缩到 256 维（单层 VQ）或 `rvq_hidden_dim`（RVQ）。`in_proj` 可为单层 Linear 或多层 MLP：当配置 `in_proj_hidden_dims` 非空时（如 [1024, 512]）为 concat_dim → … → codebook_dim / rvq_hidden_dim 的 MLP（GELU + 可选 dropout），未配置时退化为单层 Linear。每帧单层 VQ 产生一个 token；RVQ 产生 n_layers 个 token（时间对齐后 concat 再 cond_proj 进 CFM）。
+- **单层 VQ → CFM**: 256 维 codebook embedding（straight-through）直接作为 CFM 的 `cond_code`。**RVQ**：各层 16 维量化向量按时间对齐 concat 成 (B, T, n*16)，经 `cond_proj` 映射到 256 维再进 CFM，CFM 内部仍为 `cond_emb = nn.Linear(256, 1024)`。
+- **VQ / RVQ 端到端训练**: 重建梯度通过 CFM → straight-through → in_proj 反传。单层 VQ 仅 commitment loss；RVQ 与 SoundStream / mucodec 对齐：**commitment loss**（encoder 拉向 codebook）+ **codebook loss**（codebook 拉向 encoder），可选 **L2 归一化** lookup（Improved VQGAN），权重通常为 0.25 * commitment + 1.0 * codebook。
+- **无 Prompt 机制**: codec 重建不需要参考音频 prompt。CFG dropout 保留用于推理引导。
+- **从 codes 推理**: 单层 VQ：`codes (B,T) → vq_codebook(codes)` → 256 维 → CFM。RVQ：`codes (B,T,n_layers) → rvq.lookup_codes(codes)` → concat 向量 → cond_proj → 256 维 → CFM。
 
 ## 数据流
 
@@ -52,7 +52,7 @@ flowchart TD
 whisper_feat (B,1500,1280) ──Conv1d s=2──┐
 wavlm_feat  (B,1500,1024) ──Conv1d s=2──┤── concat ──→ (B,750,3328)
 muq_feat    (B, 750,1024) ──identity────┘       │
-                                          in_proj Linear
+                                          in_proj MLP / Linear
                                          (B, 750, 256)
                                                │
                                          VQ quantize
@@ -88,6 +88,18 @@ codes (B, 750) ──vq_codebook lookup──→ z_q (B, 750, 256)
                                   waveform (B, 720000) @ 24kHz
 ```
 
+### RVQ 训练与推理
+
+- **训练**：`z_e = in_proj(concat_feat)` (B,T,rvq_hidden_dim) → ResidualVQ 逐层：proj_down → VQ(16 维) → straight-through → proj_up，残差传入下一层；各层 16 维量化向量按时间 concat → (B,T,128) → cond_proj → (B,T,256) → CFM。Loss：flow_loss + 0.25*commitment_loss + 1.0*codebook_loss。
+- **推理**：`codes (B,T,8)` → `rvq.lookup_codes(codes)` → (B,T,128) → cond_proj → (B,T,256) → CFM.generate()。
+
+RVQ 实现与 mucodec `descript_quantize3.py` 对齐：commitment + codebook loss、L2 归一化 lookup、残差逐层量化。
+
+## 训练监控（TensorBoard）
+
+- **train/codebook_util**：当前 batch 码本利用率（单层 VQ：唯一 code 数 / codebook_size；RVQ：各层利用率取平均），用于观察 codebook collapse。
+- **vq/code_usage**：code 索引使用分布直方图（每若干 step 记录）。
+
 ## Flow Matching 核心公式
 
 **插值路径**: $x_t = (1 - (1-\sigma)t) \cdot z + t \cdot x$ ，其中 $z \sim \mathcal{N}(0,I)$
@@ -109,6 +121,9 @@ code/codec/
 ├── llama.py              # DiffLlama（非因果 Llama + AdaptiveRMSNorm）
 ├── config.yaml           # 模型超参数配置
 │
+├── dataset/
+│   ├── codec_dataset.py   # CodecDataset, CodecWebDataset, init_dataset_and_dataloader
+│   └── mel_to_features.py # 训练时 mel→波形→Whisper/WavLM/MuQ 在线特征（CodecFeatureExtractor）
 ├── whisper_feature.py    # Whisper 特征提取脚本
 ├── wavlm_feature.py      # WavLM 特征提取脚本
 ├── muq_feature.py        # MuQ 特征提取脚本
@@ -122,17 +137,24 @@ code/codec/
 
 | 方法 | 用途 | 输入 | 输出 |
 |------|------|------|------|
-| `encode()` | 特征 → VQ codes | 3 路连续特征 | codes (B,750), z_q_st (B,750,256), commit_loss |
-| `forward()` | 训练 | 3 路特征 + mel + mask | cfm_output + commit_loss + codes |
-| `decode_from_codes()` | LM 推理 | codes (B,750) | mel (B,1500,128) |
+| `encode()` | 特征 → VQ codes | 3 路连续特征 | z_q_st (B,T,256), codes (B,T) 或 (B,T,n_layers), commit_loss [, codebook_loss 仅 RVQ] |
+| `forward()` | 训练 | 3 路特征 + mel + mask | cfm_output + commit_loss + codes [+ codebook_loss 仅 RVQ] |
+| `decode_from_codes()` | LM 推理 | codes (B,T) 或 (B,T,n_layers) | mel (B,1500,128) |
 | `decode_from_features()` | 重建推理 | 3 路连续特征 | mel (B,1500,128) + codes |
 
 ## 超参数
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| codebook_size | 8192 | VQ 码本大小 |
-| codebook_dim | 256 | 码本向量维度（= in_proj 输出维度） |
+| codebook_size | 8192 | 单层 VQ 码本大小 |
+| codebook_dim | 256 | 单层 VQ 码本向量维度（= in_proj 输出维度） |
+| use_rvq | false | 是否使用 8 层 RVQ（覆盖单层 VQ） |
+| rvq_codebook_sizes | 如 [1024]*8 | RVQ 每层码本大小（可变层数） |
+| rvq_hidden_dim | 256 | RVQ 残差空间维度 |
+| rvq_codebook_dim | 16 | RVQ 每层离散维度；concat 后 cond_proj 进 CFM |
+| cfm_cond_dim | 256 | 送入 CFM 的条件维度（单层 256；RVQ 经 cond_proj 128→256） |
+| in_proj_hidden_dims | 如 [1024, 512] 或 null | in_proj 隐藏层维度；null/[] 时为单层 Linear |
+| in_proj_dropout | 0.1 | in_proj MLP 层间 dropout（仅多层时生效） |
 | mel_dim | 128 | Mel 频谱维度 |
 | hidden_size | 1024 | DiffLlama 隐藏维度 |
 | num_layers | 22 | DiffLlama Transformer 层数 |
@@ -143,6 +165,8 @@ code/codec/
 | n_timesteps | 32 | 推理 Euler 步数 |
 | sample_rate | 24000 | 音频采样率 |
 | hop_size | 480 | Mel 帧步长（→ 50Hz） |
+| commit_loss_weight | 0.25 | 训练时 commitment loss 权重 |
+| codebook_loss_weight | 1.0 | 训练时 codebook loss 权重（仅 RVQ） |
 
 ## 依赖
 

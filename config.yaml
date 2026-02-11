@@ -10,9 +10,20 @@ model:
   muq_frame_rate: 25       # 24kHz / 240 hop / 4x conv downsample
   target_frame_rate: 25    # common frame rate after resampling
 
-  # VQ (single codebook for concatenated features)
+  # VQ: single-layer (default) or 8-layer RVQ
+  # Single VQ:
   codebook_size: 8192
-  codebook_dim: 256        # in_proj: 3328 → 256, codebook entry dim
+  codebook_dim: 256        # in_proj output dim, codebook entry dim
+  # RVQ (use_rvq: true): 8 layers, each layer discretized dim = 16, concat → cond_proj → CFM
+  # use_rvq: false
+  # rvq_codebook_sizes: [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]  # 8x1024
+  # rvq_hidden_dim: 256
+  # rvq_codebook_dim: 16
+  # cfm_cond_dim: 256      # condition dim fed to CFM (RVQ concat 8*16=128 → cond_proj 128→256)
+
+  # in_proj: concat (3328) → codebook_dim (single) or rvq_hidden_dim (RVQ). None or [] = single Linear; else MLP
+  in_proj_hidden_dims: [1024, 512]
+  in_proj_dropout: 0.1
 
   # CFM (FlowMatchingTransformer → DiffLlama)
   mel_dim: 128

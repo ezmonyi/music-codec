@@ -161,7 +161,23 @@ class FlowMatchingTransformer(nn.Module):
             xt: noised mel
             z:  noise sample
         """
-        t_expand = t.unsqueeze(-1).unsqueeze(-1)  # (B, 1, 1)
+        # Ensure t is 1D: (B,)
+        # Handle various input shapes: (B,), (B, 1), (1, B), etc.
+        if t.dim() == 0:
+            t = t.unsqueeze(0)
+        elif t.dim() > 1:
+            # If t is (B, T) or similar, take the first element along time dim
+            # or flatten and take first B elements
+            if t.shape[0] == x.shape[0]:
+                t = t[:, 0] if t.shape[1] > 1 else t.squeeze(-1)
+            else:
+                t = t.flatten()[:x.shape[0]]
+        
+        # Ensure t has shape (B,)
+        assert t.shape[0] == x.shape[0], f"Batch size mismatch: t.shape={t.shape}, x.shape={x.shape}"
+        
+        # Expand t to (B, 1, 1) for broadcasting with (B, T, mel_dim)
+        t_expand = t.view(-1, 1, 1)  # (B, 1, 1)
         z = torch.randn(x.shape, dtype=x.dtype, device=x.device, requires_grad=False)
 
         # xt = (1 - (1-sigma)*t) * z + t * x
@@ -221,8 +237,43 @@ class FlowMatchingTransformer(nn.Module):
         return self.compute_loss(x, x_mask, cond)
 
     # ------------------------------------------------------------------
-    #  Inference
+    #  Inference / training-time generation
     # ------------------------------------------------------------------
+
+    def reverse_diffusion_train(
+        self, cond, x_mask=None, n_timesteps=32, cfg=0.0, rescale_cfg=0.75
+    ):
+        """Generate mel via Euler ODE (keeps graph for gradients). Use for mel_recon / disc loss.
+
+        Same as reverse_diffusion but without no_grad, so pred_mel has requires_grad.
+        """
+        h = 1.0 / n_timesteps
+        B, T, _ = cond.shape
+
+        if x_mask is None:
+            x_mask = torch.ones(B, T, device=cond.device, dtype=cond.dtype)
+
+        z = torch.randn(
+            (B, T, self.mel_dim), dtype=cond.dtype, device=cond.device
+        )
+        xt = z
+
+        for i in range(n_timesteps):
+            t = (i + 0.5) * h * torch.ones(B, dtype=cond.dtype, device=cond.device)
+            flow_pred = self.diff_estimator(xt, t, cond, x_mask)
+
+            if cfg > 0:
+                uncond_flow_pred = self.diff_estimator(
+                    xt, t, torch.zeros_like(cond), x_mask
+                )
+                pos_std = flow_pred.std()
+                flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
+                rescaled = flow_pred_cfg * pos_std / flow_pred_cfg.std()
+                flow_pred = rescale_cfg * rescaled + (1 - rescale_cfg) * flow_pred_cfg
+
+            xt = xt + flow_pred * h
+
+        return xt
 
     @torch.no_grad()
     def reverse_diffusion(

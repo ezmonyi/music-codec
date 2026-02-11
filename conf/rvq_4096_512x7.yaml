@@ -1,0 +1,49 @@
+# RVQ ablation: [4096, 512, 512, 512, 512, 512, 512, 512]. Discretized dim = 16 per layer.
+
+__set_seed1: !apply:random.seed [42]
+__set_seed2: !apply:numpy.random.seed [42]
+__set_seed3: !apply:torch.manual_seed [42]
+__set_seed4: !apply:torch.cuda.manual_seed_all [42]
+
+dataset_conf:
+  manifest_path: ""
+  max_frames_50hz: 1500
+  seed: 42
+
+model: !new:model.AudioReconModel
+  whisper_dim: 1280
+  wavlm_dim: 1024
+  muq_dim: 1024
+  use_rvq: true
+  rvq_codebook_sizes: [4096, 512, 512, 512, 512, 512, 512, 512]
+  rvq_hidden_dim: 256
+  rvq_codebook_dim: 16
+  cfm_cond_dim: 256
+  in_proj_hidden_dims: [1024, 512]
+  in_proj_dropout: 0.1
+  mel_dim: 128
+  hidden_size: 1024
+  num_layers: 22
+  num_heads: 16
+  cfg_drop_prob: 0.2
+  sigma: 1.0e-5
+  time_scheduler: cos
+  cond_scale_factor: 2
+
+train_conf:
+  dtype: fp32
+  batch_size: 8
+  optim: adamw
+  optim_conf:
+    lr: 3.0e-4
+  scheduler: warmuplr
+  scheduler_conf:
+    warmup_steps: 5000
+    last_epoch: -1
+  max_epoch: 200
+  grad_clip: 5.0
+  accum_grad: 1
+  log_interval: 50
+  save_per_step: 2000
+  commit_loss_weight: 0.25
+  codebook_loss_weight: 1.0

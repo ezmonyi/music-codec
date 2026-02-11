@@ -1,0 +1,30 @@
+# Dataset config for codec training.
+# Option A - WebDataset (tar shards): set urls to a glob pattern, e.g. .../shard_48*.tar
+# Option B - JSONL manifest: set manifest_path to a JSONL with whisper_path, wavlm_path, muq_path, mel_path per line.
+#
+# Tar structure (from shard_48*): each sample = {id}_seg{NN}.json + {id}_seg{NN}.mel.npz
+# With use_mel_extractor: true, only mel.npz is loaded; whisper/wavlm/muq are computed on-the-fly from mel
+# (mel → waveform via inverse mel → Whisper/WavLM/MuQ). Use official/HF model names for default download.
+
+urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w/shard_48*.tar"
+
+use_mel_extractor: true
+feature_extractor:
+  device: "cuda"
+  # All models: default download (Whisper → download_root; WavLM/MuQ → hf_cache_dir)
+  # WavLM: use local checkpoint to avoid HF download timeout
+  whisper_name: "large-v3"
+  whisper_download_root: "/data/whisper"
+  wavlm_ckpt: "/mnt/yi-jfs/pretrained_models/wavlm"
+  muq_name: "OpenMuQ/MuQ-large-msd-iter"
+  hf_cache_dir: "/data/.huggingface"
+  sample_rate: 24000
+  n_fft: 1920
+  hop_length: 480
+  n_mels: 128
+
+feature_keys:
+  mel: "mel.npz"
+
+max_frames_50hz: 1500
+seed: 42

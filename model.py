@@ -10,7 +10,7 @@ Architecture (see config.yaml for hyperparameters):
                                     concat dim=-1
                                    (B, 750, 3328)
                                           │
-                                    in_proj Linear
+                                    in_proj (Linear or MLP)
                                    (B, 750, 256)
                                           │
                                     VQ codebook
@@ -29,6 +29,7 @@ Architecture (see config.yaml for hyperparameters):
 import os
 import sys
 import math
+from typing import Optional, Sequence, List
 
 import torch
 import torch.nn as nn
@@ -38,8 +39,104 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flow_matching import FlowMatchingTransformer
 
 
+class ResidualVQ(nn.Module):
+    """
+    Residual VQ aligned with SoundStream / mucodec descript_quantize3 style:
+    - Per layer: proj_down → VQ(codebook_dim) → proj_up; residual = residual - proj_up(z_q).
+    - Commitment loss: encoder → codebook. Codebook loss: codebook → encoder (Improved VQGAN).
+    - Optional L2-normalized lookup (ViT-VQGAN) for stability and codebook usage.
+    - Output for condition: concat of quantized 16-dim per layer (time-aligned).
+    """
+
+    def __init__(
+        self,
+        rvq_hidden_dim: int,
+        codebook_sizes: List[int],
+        codebook_dim: int = 16,
+        use_l2_norm: bool = True,
+        use_ema: bool = False,
+        ema_decay: float = 0.99,
+    ):
+        super().__init__()
+        self.rvq_hidden_dim = rvq_hidden_dim
+        self.codebook_sizes = list(codebook_sizes)
+        self.codebook_dim = codebook_dim
+        self.n_layers = len(self.codebook_sizes)
+        self.use_l2_norm = use_l2_norm
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
+
+        self.proj_downs = nn.ModuleList()
+        self.codebooks = nn.ModuleList()
+        self.proj_ups = nn.ModuleList()
+        for K in self.codebook_sizes:
+            self.proj_downs.append(nn.Linear(rvq_hidden_dim, codebook_dim))
+            self.codebooks.append(nn.Embedding(K, codebook_dim))
+            self.proj_ups.append(nn.Linear(codebook_dim, rvq_hidden_dim))
+        for m in self.proj_downs:
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        for m in self.proj_ups:
+            nn.init.normal_(m.weight, 0.0, 0.02)
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)
+        for emb in self.codebooks:
+            nn.init.normal_(emb.weight, 0.0, 0.02)
+
+    def forward(self, z_e):
+        """z_e: (B, T, rvq_hidden_dim). Returns z_q_concat (B,T,n*16), codes (B,T,n), commitment_loss, codebook_loss."""
+        B, T, D = z_e.shape
+        residual = z_e
+        z_q_list = []
+        codes_list = []
+        commitment_losses = []
+        codebook_losses = []
+        for i in range(self.n_layers):
+            z_e_i = self.proj_downs[i](residual)  # (B, T, codebook_dim)
+            z_e_flat = z_e_i.reshape(-1, self.codebook_dim)
+            cb = self.codebooks[i].weight  # (K, codebook_dim)
+            if self.use_l2_norm:
+                z_e_flat = F.normalize(z_e_flat, dim=-1)
+                cb = F.normalize(cb, dim=-1)
+            distances = torch.cdist(z_e_flat, cb)
+            codes_i = distances.argmin(dim=-1)
+            z_q_i = self.codebooks[i](codes_i).reshape(B, T, self.codebook_dim)
+            # Straight-through (reference: z_q = z_e + (z_q - z_e).detach())
+            z_q_st_i = z_e_i + (z_q_i - z_e_i).detach()
+            commitment_losses.append(F.mse_loss(z_e_i, z_q_i.detach()))
+            codebook_losses.append(F.mse_loss(z_q_i, z_e_i.detach()))
+            residual = residual - self.proj_ups[i](z_q_i.detach())
+            if self.use_ema and self.training:
+                self._ema_update_codebook(i, z_e_i.detach(), codes_i, B * T)
+            z_q_list.append(z_q_st_i)
+            codes_list.append(codes_i.reshape(B, T))
+        z_q_concat = torch.cat(z_q_list, dim=-1)
+        codes = torch.stack(codes_list, dim=-1)
+        commitment_loss = sum(commitment_losses)
+        codebook_loss = sum(codebook_losses)
+        return z_q_concat, codes, commitment_loss, codebook_loss
+
+    def _ema_update_codebook(self, layer_idx: int, z_e_flat: torch.Tensor, codes_flat: torch.Tensor, n: int):
+        """EMA update: codebook[k] = (1-decay)*codebook[k] + decay*mean(z_e where codes==k)."""
+        K = self.codebook_sizes[layer_idx]
+        D = self.codebook_dim
+        with torch.no_grad():
+            one_hot = F.one_hot(codes_flat, K).float()  # (n, K)
+            count = one_hot.sum(0).clamp(min=1)  # (K,)
+            sum_ = one_hot.T @ z_e_flat  # (K, D)
+            mean = sum_ / count.unsqueeze(-1)
+            emb = self.codebooks[layer_idx].weight
+            emb.data = (1 - self.ema_decay) * emb.data + self.ema_decay * mean
+
+    def lookup_codes(self, codes: torch.Tensor):
+        """codes: (B, T, n_layers). Returns (B, T, n_layers * codebook_dim)."""
+        z_list = [self.codebooks[i](codes[..., i]) for i in range(self.n_layers)]
+        return torch.cat(z_list, dim=-1)
+
+
 class AudioReconModel(nn.Module):
-    """Audio reconstruction codec: features → VQ tokens → CFM → mel."""
+    """Audio reconstruction codec: features → VQ tokens (single VQ or RVQ) → CFM → mel."""
 
     def __init__(
         self,
@@ -47,9 +144,17 @@ class AudioReconModel(nn.Module):
         whisper_dim=1280,
         wavlm_dim=1024,
         muq_dim=1024,
-        # VQ
+        # VQ: single-layer
         codebook_size=8192,
         codebook_dim=256,
+        # RVQ: 8-layer residual VQ (overrides single VQ when use_rvq=True)
+        use_rvq: bool = False,
+        rvq_codebook_sizes: Optional[Sequence[int]] = None,
+        rvq_hidden_dim: int = 256,
+        rvq_codebook_dim: int = 16,
+        # in_proj: concat_dim → codebook_dim (single) or rvq_hidden_dim (RVQ)
+        in_proj_hidden_dims: Optional[Sequence[int]] = None,
+        in_proj_dropout: float = 0.0,
         # CFM
         mel_dim=128,
         hidden_size=1024,
@@ -59,12 +164,29 @@ class AudioReconModel(nn.Module):
         sigma=1e-5,
         time_scheduler="cos",
         cond_scale_factor=2,  # 25Hz → 50Hz
+        cfm_cond_dim: int = 256,  # condition dim fed to CFM (256 for single VQ; RVQ uses cond_proj 128→256)
+        use_codebook_ema: bool = False,
+        ema_decay: float = 0.99,
     ):
         super().__init__()
 
-        self.codebook_dim = codebook_dim
-        self.codebook_size = codebook_size
+        self.use_rvq = use_rvq
+        self.use_codebook_ema = use_codebook_ema
+        self.ema_decay = ema_decay
         self.mel_dim = mel_dim
+        concat_dim = whisper_dim + wavlm_dim + muq_dim  # 3328
+
+        if use_rvq:
+            rvq_sizes = list(rvq_codebook_sizes) if rvq_codebook_sizes else [1024] * 8
+            self.n_rvq_layers = len(rvq_sizes)
+            self.codebook_dim = self.n_rvq_layers * rvq_codebook_dim  # concat cond dim, e.g. 128
+            self.codebook_size = sum(rvq_sizes)  # for logging; codes are (B,T,n_layers)
+            self.rvq_cond_dim = self.n_rvq_layers * rvq_codebook_dim
+        else:
+            self.codebook_dim = codebook_dim
+            self.codebook_size = codebook_size
+            self.n_rvq_layers = 0
+            self.rvq_cond_dim = 0
 
         # ── Feature resamplers: 50Hz → 25Hz ──────────────────────────
         self.whisper_resample = nn.Conv1d(
@@ -73,24 +195,51 @@ class AudioReconModel(nn.Module):
         self.wavlm_resample = nn.Conv1d(
             wavlm_dim, wavlm_dim, kernel_size=4, stride=2, padding=1
         )
-        # MuQ is already at 25Hz — no resampling needed
 
-        # ── Projection: concat dim → codebook dim ────────────────────
-        concat_dim = whisper_dim + wavlm_dim + muq_dim  # 3328
-        self.in_proj = nn.Linear(concat_dim, codebook_dim)
+        # ── Projection: concat → single-VQ dim or RVQ hidden dim ────────────────────
+        out_dim = rvq_hidden_dim if use_rvq else codebook_dim
+        if not in_proj_hidden_dims:
+            self.in_proj = nn.Linear(concat_dim, out_dim)
+        else:
+            layers = []
+            dims = [concat_dim] + list(in_proj_hidden_dims) + [out_dim]
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(nn.GELU())
+                    if in_proj_dropout > 0:
+                        layers.append(nn.Dropout(in_proj_dropout))
+            self.in_proj = nn.Sequential(*layers)
+            for m in self.in_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
 
-        # ── VQ codebook ──────────────────────────────────────────────
-        self.vq_codebook = nn.Embedding(codebook_size, codebook_dim)
-        nn.init.normal_(self.vq_codebook.weight, mean=0.0, std=0.02)
+        if use_rvq:
+            self.rvq = ResidualVQ(
+                rvq_hidden_dim, rvq_sizes, rvq_codebook_dim,
+                use_ema=use_codebook_ema, ema_decay=ema_decay,
+            )
+            self.cond_proj = nn.Linear(self.rvq_cond_dim, cfm_cond_dim)
+            nn.init.normal_(self.cond_proj.weight, 0.0, 0.02)
+            if self.cond_proj.bias is not None:
+                nn.init.zeros_(self.cond_proj.bias)
+            self.vq_codebook = None
+        else:
+            self.vq_codebook = nn.Embedding(codebook_size, codebook_dim)
+            nn.init.normal_(self.vq_codebook.weight, mean=0.0, std=0.02)
+            self.rvq = None
+            self.cond_proj = None
 
-        # ── CFM decoder ──────────────────────────────────────────────
+        # ── CFM decoder (always receives cfm_cond_dim) ──────────────────────────────────────────────
         self.cfm = FlowMatchingTransformer(
             mel_dim=mel_dim,
             hidden_size=hidden_size,
             num_layers=num_layers,
             num_heads=num_heads,
             cfg_drop_prob=cfg_drop_prob,
-            cond_dim=codebook_dim,
+            cond_dim=cfm_cond_dim,
             cond_scale_factor=cond_scale_factor,
             sigma=sigma,
             time_scheduler=time_scheduler,
@@ -127,8 +276,24 @@ class AudioReconModel(nn.Module):
         # Commitment loss: push encoder output towards codebook entries
         commit_loss = F.mse_loss(z_e, z_q.detach())
 
+        if self.use_codebook_ema and self.training:
+            self._ema_update_vq_codebook(z_e_flat.detach(), codes, B * T)
+
         codes = codes.reshape(B, T)
         return z_q_st, codes, commit_loss
+
+    def _ema_update_vq_codebook(self, z_e_flat: torch.Tensor, codes_flat: torch.Tensor, n: int):
+        """EMA update for single VQ codebook."""
+        K = self.vq_codebook.num_embeddings
+        D = self.vq_codebook.embedding_dim
+        with torch.no_grad():
+            one_hot = F.one_hot(codes_flat, K).float()  # (n, K)
+            count = one_hot.sum(0).clamp(min=1)  # (K,)
+            sum_ = one_hot.T @ z_e_flat  # (K, D)
+            mean = sum_ / count.unsqueeze(-1)
+            self.vq_codebook.weight.data = (
+                (1 - self.ema_decay) * self.vq_codebook.weight.data + self.ema_decay * mean
+            )
 
     # ==================================================================
     #  Encode
@@ -143,37 +308,42 @@ class AudioReconModel(nn.Module):
             muq_feat:    (B, T_m,  1024) @ 25Hz
 
         Returns:
-            z_q_st:      (B, T, codebook_dim) quantized embeddings (for training)
-            codes:       (B, T) discrete VQ codes
+            z_q_st:      (B, T, codebook_dim) or (B, T, rvq_cond_dim) after cond_proj for CFM
+            codes:       (B, T) single VQ or (B, T, n_layers) RVQ
             commit_loss: scalar
         """
-        # Resample whisper & wavlm from 50Hz → 25Hz  (Conv1d expects B,C,T)
         w = self.whisper_resample(whisper_feat.transpose(1, 2)).transpose(1, 2)
         wl = self.wavlm_resample(wavlm_feat.transpose(1, 2)).transpose(1, 2)
-        m = muq_feat  # already 25Hz
-
-        # Align lengths (take minimum)
+        m = muq_feat
         min_len = min(w.shape[1], wl.shape[1], m.shape[1])
         w = w[:, :min_len, :]
         wl = wl[:, :min_len, :]
         m = m[:, :min_len, :]
-
-        # Concat along feature dimension
         concat_feat = torch.cat([w, wl, m], dim=-1)  # (B, T, 3328)
+        z_e = self.in_proj(concat_feat)
 
-        # Project to codebook dimension
-        z_e = self.in_proj(concat_feat)  # (B, T, codebook_dim)
-
-        # Vector quantize
-        z_q_st, codes, commit_loss = self._vq_quantize(z_e)
-
-        return z_q_st, codes, commit_loss
+        if self.use_rvq:
+            z_q_concat, codes, commitment_loss, codebook_loss = self.rvq(z_e)
+            z_q_st = self.cond_proj(z_q_concat)  # (B, T, cfm_cond_dim)
+            return z_q_st, codes, commitment_loss, codebook_loss
+        else:
+            z_q_st, codes, commit_loss = self._vq_quantize(z_e)
+            return z_q_st, codes, commit_loss
 
     # ==================================================================
     #  Training forward
     # ==================================================================
 
-    def forward(self, whisper_feat, wavlm_feat, muq_feat, mel, mel_mask):
+    def forward(
+        self,
+        whisper_feat,
+        wavlm_feat,
+        muq_feat,
+        mel,
+        mel_mask,
+        return_pred_mel: bool = False,
+        mel_recon_n_steps: int = 4,
+    ):
         """Training forward pass.
 
         Args:
@@ -182,24 +352,33 @@ class AudioReconModel(nn.Module):
             muq_feat:    (B, T_m,  1024) @ 25Hz
             mel:         (B, T_mel, mel_dim) target mel spectrogram @ 50Hz
             mel_mask:    (B, T_mel) mask (1 = valid)
+            return_pred_mel: if True, run short ODE and return pred_mel (for mel_recon / disc loss)
+            mel_recon_n_steps: ODE steps when return_pred_mel (e.g. 4)
 
         Returns:
             dict:
                 "cfm_output": (noise, x, flow_pred, mask) for flow loss
                 "commit_loss": VQ commitment loss (scalar)
-                "codes": (B, T) discrete VQ codes
+                "codes": (B, T) single VQ or (B, T, n_layers) RVQ
+                "pred_mel": (B, T_mel, mel_dim) when return_pred_mel (keeps grad)
         """
-        # Encode: resample → concat → proj → VQ
-        z_q_st, codes, commit_loss = self.encode(whisper_feat, wavlm_feat, muq_feat)
-
-        # CFM: z_q_st (256-dim) → cond_emb (1024) → upsample → DiffLlama
+        z_q_st, codes, *vq_losses = self.encode(whisper_feat, wavlm_feat, muq_feat)
         cfm_results = self.cfm(mel, mel_mask, z_q_st)
-
-        return {
+        out = {
             "cfm_output": cfm_results["output"],
-            "commit_loss": commit_loss,
             "codes": codes,
         }
+        if self.use_rvq:
+            out["commit_loss"] = vq_losses[0]
+            out["codebook_loss"] = vq_losses[1]
+        else:
+            out["commit_loss"] = vq_losses[0]
+        if return_pred_mel:
+            cond = self.cfm.process_cond(z_q_st, target_len=mel.shape[1])
+            out["pred_mel"] = self.cfm.reverse_diffusion_train(
+                cond, mel_mask, n_timesteps=mel_recon_n_steps, cfg=0.0
+            )
+        return out
 
     # ==================================================================
     #  Inference
@@ -212,7 +391,7 @@ class AudioReconModel(nn.Module):
         """Decode mel from discrete VQ codes (for LM inference pipeline).
 
         Args:
-            codes:       (B, T) discrete VQ codes
+            codes:       (B, T) single VQ or (B, T, n_layers) RVQ
             mel_mask:    (B, T_mel) mask for output mel
             n_timesteps: Euler ODE steps
             cfg:         classifier-free guidance scale
@@ -221,7 +400,11 @@ class AudioReconModel(nn.Module):
         Returns:
             mel: (B, T_mel, mel_dim) generated mel spectrogram
         """
-        z_q = self.vq_codebook(codes)  # (B, T, codebook_dim)
+        if self.use_rvq:
+            z_q = self.rvq.lookup_codes(codes)  # (B, T, rvq_cond_dim)
+            z_q = self.cond_proj(z_q)  # (B, T, cfm_cond_dim)
+        else:
+            z_q = self.vq_codebook(codes)
         return self.cfm.generate(z_q, mel_mask, n_timesteps, cfg, rescale_cfg)
 
     @torch.no_grad()
@@ -305,5 +488,49 @@ if __name__ == "__main__":
     )
     print(f"  generated mel shape: {gen_mel2.shape}")  # (2, 1500, 128)
     print(f"  codes match: {torch.equal(codes, codes2)}")
+
+    # --- in_proj MLP variant ---
+    print("\n--- in_proj MLP (hidden_dims=[1024, 512]) ---")
+    model_mlp = AudioReconModel(
+        mel_dim=128,
+        hidden_size=256,
+        num_layers=4,
+        num_heads=8,
+        codebook_size=8192,
+        codebook_dim=256,
+        in_proj_hidden_dims=[1024, 512],
+        in_proj_dropout=0.1,
+    ).to(device)
+    z_q_st, codes_mlp, _ = model_mlp.encode(whisper_feat, wavlm_feat, muq_feat)
+    assert z_q_st.shape == (B, 750, 256), f"z_q_st shape {z_q_st.shape}"
+    assert codes_mlp.shape == (B, 750), f"codes shape {codes_mlp.shape}"
+    results_mlp = model_mlp(whisper_feat, wavlm_feat, muq_feat, mel, mel_mask)
+    assert results_mlp["cfm_output"][1].shape == (B, 1500, 128)
+    print(f"  z_q_st shape: {z_q_st.shape}")
+    print(f"  codes shape: {codes_mlp.shape}")
+    print("  MLP in_proj test passed.")
+
+    # --- RVQ 8-layer variant ---
+    print("\n--- RVQ 8x1024 ---")
+    model_rvq = AudioReconModel(
+        mel_dim=128,
+        hidden_size=256,
+        num_layers=4,
+        num_heads=8,
+        use_rvq=True,
+        rvq_codebook_sizes=[1024] * 8,
+        rvq_hidden_dim=256,
+        rvq_codebook_dim=16,
+        cfm_cond_dim=256,
+    ).to(device)
+    z_rvq, codes_rvq, commit_rvq, codebook_rvq = model_rvq.encode(whisper_feat, wavlm_feat, muq_feat)
+    assert z_rvq.shape == (B, 750, 256), f"z_rvq {z_rvq.shape}"
+    assert codes_rvq.shape == (B, 750, 8), f"codes_rvq {codes_rvq.shape}"
+    out_rvq = model_rvq(whisper_feat, wavlm_feat, muq_feat, mel, mel_mask)
+    assert out_rvq["codes"].shape == (B, 750, 8)
+    gen_rvq = model_rvq.decode_from_codes(codes_rvq, n_timesteps=4)
+    assert gen_rvq.shape == (B, 1500, 128)
+    print(f"  codes shape: {codes_rvq.shape}, decode mel: {gen_rvq.shape}")
+    print("  RVQ test passed.")
 
     print("\nAll tests passed!")
