@@ -6,6 +6,7 @@ Models are loaded once per process (or lazily) and reused.
 """
 
 import glob
+import logging
 import os
 import sys
 
@@ -13,6 +14,8 @@ import numpy as np
 import torch
 import torchaudio
 import torchaudio.transforms as T
+
+logger = logging.getLogger(__name__)
 
 # Repo root and MuQ src for imports (workers may not inherit PYTHONPATH)
 _CODEC_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,6 +114,7 @@ class CodecFeatureExtractor:
 
     def _get_whisper(self):
         if self._whisper_model is None:
+            logger.info(f"[FeatureExtractor] Loading Whisper model: {self._whisper_name} on {self.device}")
             from whisper import whisper
             # Use official model name (e.g. large-v3); download to whisper_download_root if set
             name = self._whisper_name
@@ -119,14 +123,17 @@ class CodecFeatureExtractor:
                 kwargs["download_root"] = os.path.expanduser(self._whisper_download_root)
             self._whisper_model = whisper.load_model(name, **kwargs)
             self._whisper_model = self._whisper_model.eval()
+            logger.info(f"[FeatureExtractor] Whisper model loaded successfully")
         return self._whisper_model
 
     def _get_wavlm(self):
         if self._wavlm_model is None and self._wavlm_ckpt:
+            logger.info(f"[FeatureExtractor] Loading WavLM model: {self._wavlm_ckpt} on {self.device}")
             path = os.path.expanduser(self._wavlm_ckpt)
             resolved = path if os.path.isfile(path) else (_resolve_local_ckpt(self._wavlm_ckpt, ".pt") if os.path.isdir(path) else None)
             if resolved:
                 # Local checkpoint (Microsoft .pt format)
+                logger.info(f"[FeatureExtractor] Loading WavLM from local checkpoint: {resolved}")
                 from WavLM import WavLM, WavLMConfig
                 ckpt = torch.load(resolved, map_location=self.device, weights_only=False)
                 self._wavlm_cfg = WavLMConfig(ckpt["cfg"])
@@ -134,8 +141,10 @@ class CodecFeatureExtractor:
                 self._wavlm_model.load_state_dict(ckpt["model"])
                 self._wavlm_model = self._wavlm_model.to(self.device).eval()
                 self._wavlm_is_hf = False
+                logger.info(f"[FeatureExtractor] WavLM model loaded successfully")
             else:
                 # HuggingFace id (e.g. microsoft/wavlm-large) → download to hf_cache_dir if set
+                logger.info(f"[FeatureExtractor] Loading WavLM from HuggingFace: {self._wavlm_ckpt}")
                 # Suppress "some weights not initialized" / "some weights not used" (pos_conv format mismatch)
                 import logging
                 from transformers import WavLMModel
@@ -151,10 +160,12 @@ class CodecFeatureExtractor:
                     tlog.setLevel(old_level)
                 self._wavlm_model = self._wavlm_model.to(self.device).eval()
                 self._wavlm_is_hf = True
+                logger.info(f"[FeatureExtractor] WavLM model loaded successfully")
         return self._wavlm_model
 
     def _get_muq(self):
         if self._muq_model is None:
+            logger.info(f"[FeatureExtractor] Loading MuQ model: {self._muq_name} on {self.device}")
             from muq import MuQ
             # from_pretrained: HuggingFace id or local dir; cache to hf_cache_dir if set
             kwargs = {}
@@ -162,6 +173,7 @@ class CodecFeatureExtractor:
                 kwargs["cache_dir"] = os.path.expanduser(self._hf_cache_dir)
             self._muq_model = MuQ.from_pretrained(self._muq_name, **kwargs)
             self._muq_model = self._muq_model.to(self.device).eval()
+            logger.info(f"[FeatureExtractor] MuQ model loaded successfully")
         return self._muq_model
 
     def _resample_24_to_16(self, wav_24k: torch.Tensor) -> torch.Tensor:

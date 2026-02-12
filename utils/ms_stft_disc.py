@@ -4,12 +4,16 @@ Operates on waveform (B, 1, T). Use after mel_to_waveform for mel-based codec.
 """
 
 import typing as tp
+import warnings
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.utils import weight_norm
 import torchaudio
+
+# Suppress FutureWarning for torch.nn.utils.weight_norm deprecation
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 try:
     from einops import rearrange

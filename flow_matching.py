@@ -130,18 +130,20 @@ class FlowMatchingTransformer(nn.Module):
         cond = self.cond_emb(cond_code)  # (B, T_cond, hidden_size)
 
         if self.do_resampling:
-            cond = self.resampling_layers(cond.transpose(1, 2)).transpose(
-                1, 2
-            )  # upsample
+            # Transpose to (B, hidden_size, T_cond) for ConvTranspose1d
+            cond = cond.transpose(1, 2)  # (B, hidden_size, T_cond)
+            cond = self.resampling_layers(cond)  # (B, hidden_size, T_cond * scale_factor)
+            cond = cond.transpose(1, 2)  # (B, T_cond * scale_factor, hidden_size)
 
         if target_len is not None:
             if cond.shape[1] >= target_len:
                 cond = cond[:, :target_len, :]
             else:
+                # Pad to target_len by repeating the last frame
                 padding_frames = target_len - cond.shape[1]
-                last_frame = cond[:, -1:, :]
-                padding = last_frame.repeat(1, padding_frames, 1)
-                cond = torch.cat([cond, padding], dim=1)
+                last_frame = cond[:, -1:, :]  # (B, 1, hidden_size)
+                padding = last_frame.repeat(1, padding_frames, 1)  # (B, padding_frames, hidden_size)
+                cond = torch.cat([cond, padding], dim=1)  # (B, target_len, hidden_size)
 
         return cond
 
@@ -176,11 +178,17 @@ class FlowMatchingTransformer(nn.Module):
         # Ensure t has shape (B,)
         assert t.shape[0] == x.shape[0], f"Batch size mismatch: t.shape={t.shape}, x.shape={x.shape}"
         
+        # Ensure x is 3D (B, T, mel_dim)
+        if x.dim() != 3:
+            raise ValueError(f"x must be 3D (B, T, mel_dim), got shape {x.shape}")
+        
         # Expand t to (B, 1, 1) for broadcasting with (B, T, mel_dim)
         t_expand = t.view(-1, 1, 1)  # (B, 1, 1)
-        z = torch.randn(x.shape, dtype=x.dtype, device=x.device, requires_grad=False)
+        z = torch.randn_like(x)  # (B, T, mel_dim) - same shape as x
 
         # xt = (1 - (1-sigma)*t) * z + t * x
+        # Ensure shapes match for broadcasting
+        assert z.shape == x.shape, f"Shape mismatch: z.shape={z.shape}, x.shape={x.shape}"
         xt = (1 - (1 - self.sigma) * t_expand) * z + t_expand * x
 
         return xt, z
@@ -201,6 +209,12 @@ class FlowMatchingTransformer(nn.Module):
         Returns:
             dict with "output": (noise, x, flow_pred, final_mask)
         """
+        # Ensure x and cond have matching time dimensions
+        assert x.shape[1] == cond.shape[1], \
+            f"Time dimension mismatch: x.shape={x.shape}, cond.shape={cond.shape}"
+        assert x.shape[1] == x_mask.shape[1], \
+            f"Time dimension mismatch: x.shape={x.shape}, x_mask.shape={x_mask.shape}"
+        
         xt, z = self.forward_diffusion(x, t)
 
         # CFG dropout: randomly zero out condition during training
@@ -234,6 +248,9 @@ class FlowMatchingTransformer(nn.Module):
         """
         T = x.shape[1]
         cond = self.process_cond(cond_code, target_len=T)
+        # Ensure cond has the same time dimension as x
+        assert cond.shape[1] == x.shape[1], \
+            f"Time dimension mismatch after process_cond: x.shape={x.shape}, cond.shape={cond.shape}, target_len={T}"
         return self.compute_loss(x, x_mask, cond)
 
     # ------------------------------------------------------------------

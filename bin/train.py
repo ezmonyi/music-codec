@@ -16,7 +16,11 @@ import sys
 import argparse
 import datetime
 import logging
+import warnings
 from copy import deepcopy
+
+# Suppress FutureWarning for torch.nn.utils.weight_norm deprecation
+warnings.filterwarnings("ignore", category=FutureWarning, module="torch.nn.utils.weight_norm")
 
 import torch
 import torch.distributed as dist
@@ -119,9 +123,14 @@ def main():
 
     init_distributed(args)
 
+    rank = int(os.environ.get("RANK", 0))
+    if rank == 0:
+        logging.info(f"[Rank {rank}] Initializing dataset and dataloader...")
     train_dataset, cv_dataset, train_data_loader, cv_data_loader = init_dataset_and_dataloader(
         args, configs
     )
+    if rank == 0:
+        logging.info(f"[Rank {rank}] Dataset and dataloader initialized successfully")
 
     configs = check_modify_and_save_config(args, configs)
 
@@ -208,17 +217,27 @@ def main():
     executor = Executor()
     executor.step = last_step
 
+    rank = int(os.environ.get("RANK", 0))
+    logging.info(f"[Rank {rank}] Starting training loop: epochs {last_epoch} to {info_dict['max_epoch']-1}, "
+                f"starting from step {last_step}")
+
     for epoch in range(last_epoch, info_dict["max_epoch"]):
         executor.epoch = epoch
+        if rank == 0:
+            logging.info(f"[Rank {rank}] Starting epoch {epoch}/{info_dict['max_epoch']-1}")
         if hasattr(train_data_loader, "sampler") and hasattr(
             train_data_loader.sampler, "set_epoch"
         ):
             train_data_loader.sampler.set_epoch(epoch)
         dist.barrier()
+        if rank == 0:
+            logging.info(f"[Rank {rank}] Creating DDP group for epoch {epoch}")
         group_join = dist.new_group(
             backend="nccl",
             timeout=datetime.timedelta(seconds=args.timeout),
         )
+        if rank == 0:
+            logging.info(f"[Rank {rank}] Entering train_one_epoc for epoch {epoch}")
         executor.train_one_epoc(
             model,
             optimizer,
@@ -229,6 +248,8 @@ def main():
             info_dict,
             group_join,
         )
+        if rank == 0:
+            logging.info(f"[Rank {rank}] Completed epoch {epoch}")
         dist.destroy_process_group(group_join)
 
 

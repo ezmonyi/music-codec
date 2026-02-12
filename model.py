@@ -312,6 +312,14 @@ class AudioReconModel(nn.Module):
             codes:       (B, T) single VQ or (B, T, n_layers) RVQ
             commit_loss: scalar
         """
+        # Ensure all inputs are 3D (B, T, D)
+        if whisper_feat.dim() != 3:
+            raise ValueError(f"whisper_feat must be 3D (B, T, D), got shape {whisper_feat.shape}")
+        if wavlm_feat.dim() != 3:
+            raise ValueError(f"wavlm_feat must be 3D (B, T, D), got shape {wavlm_feat.shape}")
+        if muq_feat.dim() != 3:
+            raise ValueError(f"muq_feat must be 3D (B, T, D), got shape {muq_feat.shape}")
+        
         w = self.whisper_resample(whisper_feat.transpose(1, 2)).transpose(1, 2)
         wl = self.wavlm_resample(wavlm_feat.transpose(1, 2)).transpose(1, 2)
         m = muq_feat

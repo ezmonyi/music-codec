@@ -10,6 +10,7 @@ Shapes: whisper (T50, 1280), wavlm (T50, 1024), muq (T25, 1024), mel (T50, 128).
 
 import glob
 import json
+import logging
 import os
 import random
 from io import BytesIO
@@ -18,6 +19,8 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, IterableDataset
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 try:
     import webdataset as wds
@@ -118,6 +121,23 @@ class CodecCollateFn:
         m = [b["muq_feat"] for b in batch_list]
         mel = [b["mel"] for b in batch_list]
         mask = [b["mel_mask"] for b in batch_list]
+        
+        # Verify all feature shapes are correct
+        for i, feat in enumerate(w):
+            if feat.dim() != 2:
+                raise ValueError(f"whisper_feat[{i}] must be 2D (T, D), got shape {feat.shape}")
+        for i, feat in enumerate(wl):
+            if feat.dim() != 2:
+                raise ValueError(f"wavlm_feat[{i}] must be 2D (T, D), got shape {feat.shape}")
+        for i, feat in enumerate(m):
+            if feat.dim() != 2:
+                raise ValueError(f"muq_feat[{i}] must be 2D (T, D), got shape {feat.shape}")
+        for i, feat in enumerate(mel):
+            if feat.dim() != 2:
+                raise ValueError(f"mel[{i}] must be 2D (T, mel_dim), got shape {feat.shape}")
+            if feat.shape[1] != 128:
+                logger.warning(f"mel[{i}] has unexpected mel_dim: expected 128, got {feat.shape[1]}")
+        
         t50 = max(x.shape[0] for x in w)
         t25 = max(x.shape[0] for x in m)
         def pad_50(x):
@@ -151,6 +171,14 @@ class CodecCollateFn:
         muq_feat = torch.stack([pad_25(x) for x in m])
         mel = torch.stack([pad_50(x) for x in mel])
         mel_mask = torch.stack([pad_mask(x) for x in mask])
+        
+        # Verify output shapes are correct (B, T, D)
+        assert whisper_feat.dim() == 3, f"whisper_feat must be 3D after stack, got shape {whisper_feat.shape}"
+        assert wavlm_feat.dim() == 3, f"wavlm_feat must be 3D after stack, got shape {wavlm_feat.shape}"
+        assert muq_feat.dim() == 3, f"muq_feat must be 3D after stack, got shape {muq_feat.shape}"
+        assert mel.dim() == 3, f"mel must be 3D after stack, got shape {mel.shape}"
+        assert mel_mask.dim() == 2, f"mel_mask must be 2D after stack, got shape {mel_mask.shape}"
+        
         return {
             "whisper_feat": whisper_feat,
             "wavlm_feat": wavlm_feat,
@@ -186,7 +214,83 @@ def _decode_npy_or_pt(data, key):
 
 
 def _align_and_crop_codec(whisper, wavlm, muq, mel, max_frames_50hz, rng):
-    """Align T50/T25 and optionally crop to max_frames_50hz."""
+    """Align T50/T25 and optionally crop to max_frames_50hz.
+    
+    All inputs should be (T, D) shape. If mel has wrong shape, reshape it.
+    Expected mel shape: (T, mel_dim) where mel_dim is typically 128.
+    """
+    # Ensure mel is (T, mel_dim) - handle various input shapes
+    original_shape = mel.shape
+    mel_dim_expected = 128  # Expected mel dimension
+    
+    if mel.dim() == 2:
+        # (T, mel_dim) or (mel_dim, T)
+        # mel_dim is typically 128, T is typically > 1000
+        # If second dim is much larger than first and > 100, likely (mel_dim, T)
+        if mel.shape[1] > mel.shape[0] and mel.shape[1] > 100:
+            # Likely (mel_dim, T), transpose to (T, mel_dim)
+            mel = mel.transpose(0, 1)
+        # If first dim is small (< 200) and second is large, likely (mel_dim, T)
+        elif mel.shape[0] < 200 and mel.shape[1] > mel.shape[0]:
+            mel = mel.transpose(0, 1)
+    elif mel.dim() == 3:
+        # (channels, mel_dim, T) or (T, channels, mel_dim) or (channels, T, mel_dim)
+        # mel_dim is typically 128
+        # Check if any dimension is close to 128 (mel_dim)
+        dims = list(mel.shape)
+        mel_dim_idx = None
+        for i, d in enumerate(dims):
+            if 100 <= d <= 200:  # Likely mel_dim
+                mel_dim_idx = i
+                break
+        
+        if mel_dim_idx == 1 and dims[0] <= 2 and dims[2] > dims[1]:
+            # (channels, mel_dim, T) -> take first channel -> (mel_dim, T) -> transpose -> (T, mel_dim)
+            mel = mel[0].transpose(0, 1)
+        elif mel_dim_idx == 2 and dims[0] > dims[1]:
+            # (T, channels, mel_dim) -> take first channel -> (T, mel_dim)
+            mel = mel[:, 0, :]
+        elif mel_dim_idx == 1 and dims[0] <= 2:
+            # (channels, T, mel_dim) -> take first channel -> (T, mel_dim)
+            mel = mel[0]
+        else:
+            # Try common patterns: (channels, mel_dim, T) is most common
+            if dims[0] <= 2 and dims[2] > dims[1] and dims[1] <= 200:
+                # (channels, mel_dim, T)
+                mel = mel[0].transpose(0, 1)
+            elif dims[0] > 100 and dims[1] <= 2 and dims[2] <= 200:
+                # (T, channels, mel_dim)
+                mel = mel[:, 0, :]
+            else:
+                # Default: take first channel along first dim
+                mel = mel[0]
+                if mel.dim() == 2 and mel.shape[0] < mel.shape[1] and mel.shape[0] < 200:
+                    mel = mel.transpose(0, 1)
+    elif mel.dim() == 4:
+        # (B, channels, mel_dim, T) or (B, channels, T, mel_dim) or (B, T, channels, mel_dim)
+        # Take first batch
+        mel = mel[0]
+        # Now it's 3D, recurse
+        if mel.dim() == 3:
+            if mel.shape[0] <= 2 and mel.shape[1] <= 200 and mel.shape[2] > mel.shape[1]:
+                mel = mel[0].transpose(0, 1)
+            elif mel.shape[2] <= 200:
+                mel = mel[:, 0, :]
+            else:
+                mel = mel[0]
+                if mel.dim() == 2 and mel.shape[0] < mel.shape[1] and mel.shape[0] < 200:
+                    mel = mel.transpose(0, 1)
+    
+    # Final check: ensure mel is (T, mel_dim) where mel_dim is typically 128
+    if mel.dim() != 2:
+        raise ValueError(f"mel must be 2D (T, mel_dim) after reshaping, got shape {mel.shape} (original: {original_shape})")
+    
+    # Verify mel_dim is reasonable (typically 128)
+    if mel.shape[1] > 200:
+        # Likely (T, something_else), check if we need to transpose
+        if mel.shape[0] < mel.shape[1]:
+            mel = mel.transpose(0, 1)
+    
     t50 = min(whisper.shape[0], wavlm.shape[0], mel.shape[0])
     t25 = min(muq.shape[0], t50 // 2)
     t50 = t25 * 2
@@ -256,11 +360,13 @@ class CodecWebDataset(IterableDataset):
             return self._feature_extractor
         if not self.use_mel_extractor or not self._feature_extractor_conf:
             return None
+        logger.info(f"[CodecWebDataset] Initializing feature extractor (rank={self.rank})")
         from dataset.mel_to_features import CodecFeatureExtractor
         conf = dict(self._feature_extractor_conf)
         if conf.get("wavlm_ckpt") == "":
             conf["wavlm_ckpt"] = None
         self._feature_extractor = CodecFeatureExtractor(**conf)
+        logger.info(f"[CodecWebDataset] Feature extractor initialized (rank={self.rank})")
         return self._feature_extractor
 
     def _decode_sample(self, sample):
@@ -286,9 +392,27 @@ class CodecWebDataset(IterableDataset):
             if whisper is None or wavlm is None or muq is None:
                 return None
 
+        # Log mel shape before alignment for debugging
+        if hasattr(self, '_debug_logged') and not self._debug_logged:
+            logger.info(f"[CodecWebDataset] mel shape before _align_and_crop_codec: {mel.shape}")
+            self._debug_logged = True
+        
         whisper, wavlm, muq, mel, mel_mask = _align_and_crop_codec(
             whisper, wavlm, muq, mel, self.max_frames_50hz, self.rng
         )
+        
+        # Verify all feature shapes after alignment (should be 2D: T, D)
+        if whisper.dim() != 2:
+            raise ValueError(f"whisper must be 2D (T, D) after _align_and_crop_codec, got shape {whisper.shape}")
+        if wavlm.dim() != 2:
+            raise ValueError(f"wavlm must be 2D (T, D) after _align_and_crop_codec, got shape {wavlm.shape}")
+        if muq.dim() != 2:
+            raise ValueError(f"muq must be 2D (T, D) after _align_and_crop_codec, got shape {muq.shape}")
+        if mel.dim() != 2:
+            raise ValueError(f"mel must be 2D (T, mel_dim) after _align_and_crop_codec, got shape {mel.shape}")
+        if mel.shape[1] != 128:
+            logger.warning(f"[CodecWebDataset] Unexpected mel_dim: expected 128, got {mel.shape[1]}")
+        
         return {
             "whisper_feat": whisper,
             "wavlm_feat": wavlm,
@@ -305,14 +429,20 @@ class CodecWebDataset(IterableDataset):
         random.Random(self.rank * 1000 + worker_id).shuffle(urls)
         if self.world_size > 1:
             urls = [u for i, u in enumerate(urls) if i % self.world_size == self.rank]
+        if worker_id == 0 and self.rank == 0:
+            logger.info(f"[CodecWebDataset] Worker {worker_id} (rank {self.rank}): Processing {len(urls)} shards")
         pipeline = wds.DataPipeline(
             wds.SimpleShardList(urls),
             wds.tarfile_to_samples(handler=self.handler),
             wds.shuffle(1000),
         )
+        sample_count = 0
         for sample in pipeline:
             out = self._decode_sample(sample)
             if out is not None:
+                sample_count += 1
+                if sample_count == 1 and worker_id == 0 and self.rank == 0:
+                    logger.info(f"[CodecWebDataset] Worker {worker_id} (rank {self.rank}): First sample decoded successfully")
                 yield out
 
     def __len__(self):
@@ -357,15 +487,19 @@ def init_dataset_and_dataloader(args, configs):
             use_mel_extractor=use_mel_extractor,
             feature_extractor_conf=feature_extractor_conf if use_mel_extractor else None,
         )
+        num_workers_val = getattr(args, "num_workers", 4)
+        logging.info(f"[DataLoader] Creating DataLoader: batch_size={batch_size}, num_workers={num_workers_val}, "
+                    f"use_mel_extractor={use_mel_extractor}")
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=batch_size,
-            num_workers=getattr(args, "num_workers", 4),
+            num_workers=num_workers_val,
             collate_fn=collate_fn,
             pin_memory=getattr(args, "pin_memory", False),
-            prefetch_factor=getattr(args, "prefetch", 2) if getattr(args, "num_workers", 0) > 0 else None,
+            prefetch_factor=getattr(args, "prefetch", 2) if num_workers_val > 0 else None,
             drop_last=True,
         )
+        logging.info(f"[DataLoader] DataLoader created successfully")
         cv_dataset = None
         cv_loader = None
         return train_dataset, cv_dataset, train_loader, cv_loader
