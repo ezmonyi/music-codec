@@ -17,6 +17,7 @@ from utils.train_utils import (
     batch_backward,
     save_model_opt,
     cosyvoice_join,
+    get_scheduled_vq_weights,
 )
 
 
@@ -96,6 +97,7 @@ class Executor:
                     info_dict["step"] = self.step
                     info_dict["epoch"] = self.epoch
                     info_dict["batch_idx"] = batch_idx
+                    info_dict.update(get_scheduled_vq_weights(self.step, info_dict))
                     if cosyvoice_join(group_join, info_dict):
                         logging.warning("cosyvoice_join break this epoch")
                         break
@@ -186,6 +188,7 @@ class Executor:
                 info_dict["step"] = self.step
                 info_dict["epoch"] = self.epoch
                 info_dict["batch_idx"] = batch_idx
+                info_dict.update(get_scheduled_vq_weights(self.step, info_dict))
                 num_utts = batch_dict["mel"].shape[0]
                 total_num += num_utts
                 info_dict = batch_forward(model, batch_dict, info_dict)

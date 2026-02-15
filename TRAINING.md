@@ -83,8 +83,9 @@ codec/
   - `wavlm_ckpt`: WavLM 目录或 .pt 路径（如 `/mnt/yi-jfs/pretrained_models/wavlm`）
   - `muq_name`: 本地 MuQ 目录（如 `/mnt/yi-jfs/pretrained_models/muq-large-msd-iter`）
   - 可选：`sample_rate`、`n_fft`、`hop_length`、`n_mels`（与 codec mel 一致）
-
-DataLoader 在取样本时只读 mel.npz，由 `CodecFeatureExtractor`（`dataset/mel_to_features.py`）将 mel 反演为波形，再跑 Whisper（16k）、WavLM（16k）、MuQ（24k）得到特征，与 mel 对齐后送入模型。无需预先准备 whisper.npy / wavlm.npy / muq.npy。
+- **特征提取位置**：
+  - **DataLoader 内提取（默认）**：不设置或设置 **feature_extraction_on_gpu: false** 时，DataLoader 在取样本时只读 mel.npz，由 `CodecFeatureExtractor` 在 **CPU** 上将 mel 反演为波形，再跑 Whisper / WavLM / MuQ 得到特征，与 mel 对齐后送入模型。
+  - **训练进程内 GPU 提取（推荐）**：设置 **feature_extraction_on_gpu: true** 时，DataLoader 只加载 mel（及 mel_mask），不创建特征提取器；训练进程在 **GPU** 上对每个 batch 运行 Whisper / WavLM / MuQ 后再送入模型。更快、避免 worker CPU 瓶颈与 IPC 开销。无需预先准备 whisper.npy / wavlm.npy / muq.npy。
 
 运行训练时需将 **codec 根目录加入 PYTHONPATH**（例如在 codec 下执行 `export PYTHONPATH=$PWD`），以便 worker 能正确 `import dataset.mel_to_features` 及 whisper/wavlm/muq。
 

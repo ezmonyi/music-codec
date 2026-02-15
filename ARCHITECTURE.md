@@ -46,6 +46,11 @@ flowchart TD
 
 ## 数据流
 
+### 特征提取位置（仅 mel.npz 时）
+
+- **DataLoader 内（默认）**：`feature_extraction_on_gpu: false` 时，DataLoader worker 只读 mel.npz，由 `CodecFeatureExtractor` 在 CPU 上 mel→波形→Whisper/WavLM/MuQ，得到 whisper_feat / wavlm_feat / muq_feat 后与 mel 一起送入训练进程。
+- **训练进程 GPU（推荐）**：`use_mel_extractor: true` 且 **feature_extraction_on_gpu: true** 时，DataLoader 只加载 mel 与 mel_mask；训练进程在 GPU 上对每个 batch 调用 `CodecFeatureExtractor.extract_batch(mel)` 得到 3 路特征，再送入模型。更快、无 worker CPU 瓶颈。
+
 ### 训练
 
 ```

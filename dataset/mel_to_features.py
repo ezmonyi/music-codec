@@ -236,7 +236,7 @@ class CodecFeatureExtractor:
                     audio_features = torch.nn.functional.pad(
                         audio_features, (0, 0, 0, T_mel - audio_features.shape[0])
                     )
-                whisper_feat = audio_features.cpu().float()
+                whisper_feat = audio_features.float() if self.device == "cpu" else audio_features.float().to(self.device)
 
             # WavLM: 16k waveform
             wavlm_model = self._get_wavlm()
@@ -275,7 +275,7 @@ class CodecFeatureExtractor:
                     rep = torch.nn.functional.pad(
                         rep, (0, 0, 0, T_mel - rep.shape[0])
                     )
-                wavlm_feat = rep.cpu().float()
+                wavlm_feat = rep.float() if self.device == "cpu" else rep.float().to(self.device)
 
             # MuQ: 24k waveform, 25Hz
             muq_model = self._get_muq()
@@ -308,6 +308,21 @@ class CodecFeatureExtractor:
                     rep = torch.nn.functional.pad(
                         rep, (0, 0, 0, T25 - rep.shape[0])
                     )
-                muq_feat = rep.cpu().float()
+                muq_feat = rep.float() if self.device == "cpu" else rep.float().to(self.device)
 
+        return whisper_feat, wavlm_feat, muq_feat
+
+    def extract_batch(self, mel_batch):
+        """Extract features for a batch of mel. mel_batch: (B, T, 128). Returns (whisper_feat, wavlm_feat, muq_feat) as (B, T, 1280), (B, T, 1024), (B, T//2, 1024)."""
+        B = mel_batch.shape[0]
+        whisper_list, wavlm_list, muq_list = [], [], []
+        for i in range(B):
+            w, wl, m = self.extract(mel_batch[i])
+            whisper_list.append(w)
+            wavlm_list.append(wl)
+            muq_list.append(m)
+        device = mel_batch.device
+        whisper_feat = torch.stack(whisper_list, dim=0).to(device)
+        wavlm_feat = torch.stack(wavlm_list, dim=0).to(device)
+        muq_feat = torch.stack(muq_list, dim=0).to(device)
         return whisper_feat, wavlm_feat, muq_feat

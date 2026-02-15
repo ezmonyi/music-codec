@@ -34,6 +34,7 @@ from typing import Optional, Sequence, List
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from flow_matching import FlowMatchingTransformer
@@ -56,6 +57,7 @@ class ResidualVQ(nn.Module):
         use_l2_norm: bool = True,
         use_ema: bool = False,
         ema_decay: float = 0.99,
+        entropy_loss_weight: float = 0.0,
     ):
         super().__init__()
         self.rvq_hidden_dim = rvq_hidden_dim
@@ -65,6 +67,7 @@ class ResidualVQ(nn.Module):
         self.use_l2_norm = use_l2_norm
         self.use_ema = use_ema
         self.ema_decay = ema_decay
+        self.entropy_loss_weight = entropy_loss_weight
 
         self.proj_downs = nn.ModuleList()
         self.codebooks = nn.ModuleList()
@@ -85,13 +88,14 @@ class ResidualVQ(nn.Module):
             nn.init.normal_(emb.weight, 0.0, 0.02)
 
     def forward(self, z_e):
-        """z_e: (B, T, rvq_hidden_dim). Returns z_q_concat (B,T,n*16), codes (B,T,n), commitment_loss, codebook_loss."""
+        """z_e: (B, T, rvq_hidden_dim). Returns z_q_concat (B,T,n*16), codes (B,T,n), commitment_loss, codebook_loss, entropy_loss."""
         B, T, D = z_e.shape
         residual = z_e
         z_q_list = []
         codes_list = []
         commitment_losses = []
         codebook_losses = []
+        entropy_losses = []
         for i in range(self.n_layers):
             z_e_i = self.proj_downs[i](residual)  # (B, T, codebook_dim)
             z_e_flat = z_e_i.reshape(-1, self.codebook_dim)
@@ -106,6 +110,26 @@ class ResidualVQ(nn.Module):
             z_q_st_i = z_e_i + (z_q_i - z_e_i).detach()
             commitment_losses.append(F.mse_loss(z_e_i, z_q_i.detach()))
             codebook_losses.append(F.mse_loss(z_q_i, z_e_i.detach()))
+            
+            # Entropy loss for this layer
+            if self.entropy_loss_weight > 0 and self.training:
+                flat_z_e = rearrange(z_e_i, "b t d -> (b t) d")
+                z_e_norm = F.normalize(flat_z_e, dim=-1)
+                cb_norm = F.normalize(self.codebooks[i].weight, dim=-1)
+                # cosine similarity → soft assignment（temperature 控制锐度）
+                logits = z_e_norm @ cb_norm.t()  # (BT, codebook_size)，可微
+                temperature = 0.1  # 较小温度 → 接近 hard assignment 但保留梯度
+                soft_assign = F.softmax(logits / temperature, dim=-1)  # (BT, codebook_size)
+                # 求平均使用分布
+                avg_probs = soft_assign.mean(0)  # (codebook_size,)
+                # 最大化 entropy = -sum(p * log(p))
+                max_entropy = math.log(self.codebook_sizes[i])
+                entropy = -(avg_probs * torch.log(avg_probs + 1e-10)).sum()
+                entropy_loss_i = (max_entropy - entropy) / max_entropy  # 归一化到 [0, 1]
+                entropy_losses.append(entropy_loss_i)
+            else:
+                entropy_losses.append(torch.tensor(0.0, device=z_e.device, dtype=z_e.dtype))
+            
             residual = residual - self.proj_ups[i](z_q_i.detach())
             if self.use_ema and self.training:
                 self._ema_update_codebook(i, z_e_i.detach(), codes_i, B * T)
@@ -115,7 +139,8 @@ class ResidualVQ(nn.Module):
         codes = torch.stack(codes_list, dim=-1)
         commitment_loss = sum(commitment_losses)
         codebook_loss = sum(codebook_losses)
-        return z_q_concat, codes, commitment_loss, codebook_loss
+        entropy_loss = sum(entropy_losses) * self.entropy_loss_weight if self.entropy_loss_weight > 0 else torch.tensor(0.0, device=z_e.device, dtype=z_e.dtype)
+        return z_q_concat, codes, commitment_loss, codebook_loss, entropy_loss
 
     def _ema_update_codebook(self, layer_idx: int, z_e_flat: torch.Tensor, codes_flat: torch.Tensor, n: int):
         """EMA update: codebook[k] = (1-decay)*codebook[k] + decay*mean(z_e where codes==k)."""
@@ -167,6 +192,7 @@ class AudioReconModel(nn.Module):
         cfm_cond_dim: int = 256,  # condition dim fed to CFM (256 for single VQ; RVQ uses cond_proj 128→256)
         use_codebook_ema: bool = False,
         ema_decay: float = 0.99,
+        entropy_loss_weight: float = 0.0,
     ):
         super().__init__()
 
@@ -174,6 +200,7 @@ class AudioReconModel(nn.Module):
         self.use_codebook_ema = use_codebook_ema
         self.ema_decay = ema_decay
         self.mel_dim = mel_dim
+        self.entropy_loss_weight = entropy_loss_weight
         concat_dim = whisper_dim + wavlm_dim + muq_dim  # 3328
 
         if use_rvq:
@@ -220,6 +247,7 @@ class AudioReconModel(nn.Module):
             self.rvq = ResidualVQ(
                 rvq_hidden_dim, rvq_sizes, rvq_codebook_dim,
                 use_ema=use_codebook_ema, ema_decay=ema_decay,
+                entropy_loss_weight=entropy_loss_weight,
             )
             self.cond_proj = nn.Linear(self.rvq_cond_dim, cfm_cond_dim)
             nn.init.normal_(self.cond_proj.weight, 0.0, 0.02)
@@ -259,6 +287,7 @@ class AudioReconModel(nn.Module):
             z_q_st:      (B, T, codebook_dim) quantized (straight-through)
             codes:       (B, T) discrete codebook indices
             commit_loss: scalar commitment loss
+            entropy_loss: scalar entropy loss
         """
         B, T, D = z_e.shape
         z_e_flat = z_e.reshape(-1, D)  # (B*T, D)
@@ -276,11 +305,30 @@ class AudioReconModel(nn.Module):
         # Commitment loss: push encoder output towards codebook entries
         commit_loss = F.mse_loss(z_e, z_q.detach())
 
+        # Entropy loss
+        if self.entropy_loss_weight > 0 and self.training:
+            flat_z_e = rearrange(z_e, "b t d -> (b t) d")
+            z_e_norm = F.normalize(flat_z_e, dim=-1)
+            cb_norm = F.normalize(self.vq_codebook.weight, dim=-1)
+            # cosine similarity → soft assignment（temperature 控制锐度）
+            logits = z_e_norm @ cb_norm.t()  # (BT, codebook_size)，可微
+            temperature = 0.1  # 较小温度 → 接近 hard assignment 但保留梯度
+            soft_assign = F.softmax(logits / temperature, dim=-1)  # (BT, codebook_size)
+            # 求平均使用分布
+            avg_probs = soft_assign.mean(0)  # (codebook_size,)
+            # 最大化 entropy = -sum(p * log(p))
+            max_entropy = math.log(self.codebook_size)
+            entropy = -(avg_probs * torch.log(avg_probs + 1e-10)).sum()
+            entropy_loss = (max_entropy - entropy) / max_entropy  # 归一化到 [0, 1]
+            entropy_loss = entropy_loss * self.entropy_loss_weight
+        else:
+            entropy_loss = torch.tensor(0.0, device=z_e.device, dtype=z_e.dtype)
+
         if self.use_codebook_ema and self.training:
             self._ema_update_vq_codebook(z_e_flat.detach(), codes, B * T)
 
         codes = codes.reshape(B, T)
-        return z_q_st, codes, commit_loss
+        return z_q_st, codes, commit_loss, entropy_loss
 
     def _ema_update_vq_codebook(self, z_e_flat: torch.Tensor, codes_flat: torch.Tensor, n: int):
         """EMA update for single VQ codebook."""
@@ -311,6 +359,8 @@ class AudioReconModel(nn.Module):
             z_q_st:      (B, T, codebook_dim) or (B, T, rvq_cond_dim) after cond_proj for CFM
             codes:       (B, T) single VQ or (B, T, n_layers) RVQ
             commit_loss: scalar
+            codebook_loss: scalar (RVQ only)
+            entropy_loss: scalar
         """
         # Ensure all inputs are 3D (B, T, D)
         if whisper_feat.dim() != 3:
@@ -331,12 +381,12 @@ class AudioReconModel(nn.Module):
         z_e = self.in_proj(concat_feat)
 
         if self.use_rvq:
-            z_q_concat, codes, commitment_loss, codebook_loss = self.rvq(z_e)
+            z_q_concat, codes, commitment_loss, codebook_loss, entropy_loss = self.rvq(z_e)
             z_q_st = self.cond_proj(z_q_concat)  # (B, T, cfm_cond_dim)
-            return z_q_st, codes, commitment_loss, codebook_loss
+            return z_q_st, codes, commitment_loss, codebook_loss, entropy_loss
         else:
-            z_q_st, codes, commit_loss = self._vq_quantize(z_e)
-            return z_q_st, codes, commit_loss
+            z_q_st, codes, commit_loss, entropy_loss = self._vq_quantize(z_e)
+            return z_q_st, codes, commit_loss, entropy_loss
 
     # ==================================================================
     #  Training forward
@@ -368,6 +418,7 @@ class AudioReconModel(nn.Module):
                 "cfm_output": (noise, x, flow_pred, mask) for flow loss
                 "commit_loss": VQ commitment loss (scalar)
                 "codes": (B, T) single VQ or (B, T, n_layers) RVQ
+                "entropy_loss": entropy loss (scalar)
                 "pred_mel": (B, T_mel, mel_dim) when return_pred_mel (keeps grad)
         """
         z_q_st, codes, *vq_losses = self.encode(whisper_feat, wavlm_feat, muq_feat)
@@ -379,8 +430,10 @@ class AudioReconModel(nn.Module):
         if self.use_rvq:
             out["commit_loss"] = vq_losses[0]
             out["codebook_loss"] = vq_losses[1]
+            out["entropy_loss"] = vq_losses[2]
         else:
             out["commit_loss"] = vq_losses[0]
+            out["entropy_loss"] = vq_losses[1]
         if return_pred_mel:
             cond = self.cfm.process_cond(z_q_st, target_len=mel.shape[1])
             out["pred_mel"] = self.cfm.reverse_diffusion_train(
@@ -432,7 +485,7 @@ class AudioReconModel(nn.Module):
             mel:   (B, T_mel, mel_dim) generated mel spectrogram
             codes: (B, T) VQ codes
         """
-        z_q_st, codes, _ = self.encode(whisper_feat, wavlm_feat, muq_feat)
+        z_q_st, codes, *_ = self.encode(whisper_feat, wavlm_feat, muq_feat)
         mel = self.cfm.generate(z_q_st, mel_mask, n_timesteps, cfg, rescale_cfg)
         return mel, codes
 
@@ -509,7 +562,7 @@ if __name__ == "__main__":
         in_proj_hidden_dims=[1024, 512],
         in_proj_dropout=0.1,
     ).to(device)
-    z_q_st, codes_mlp, _ = model_mlp.encode(whisper_feat, wavlm_feat, muq_feat)
+    z_q_st, codes_mlp, _, _ = model_mlp.encode(whisper_feat, wavlm_feat, muq_feat)
     assert z_q_st.shape == (B, 750, 256), f"z_q_st shape {z_q_st.shape}"
     assert codes_mlp.shape == (B, 750), f"codes shape {codes_mlp.shape}"
     results_mlp = model_mlp(whisper_feat, wavlm_feat, muq_feat, mel, mel_mask)
@@ -531,7 +584,7 @@ if __name__ == "__main__":
         rvq_codebook_dim=16,
         cfm_cond_dim=256,
     ).to(device)
-    z_rvq, codes_rvq, commit_rvq, codebook_rvq = model_rvq.encode(whisper_feat, wavlm_feat, muq_feat)
+    z_rvq, codes_rvq, commit_rvq, codebook_rvq, _ = model_rvq.encode(whisper_feat, wavlm_feat, muq_feat)
     assert z_rvq.shape == (B, 750, 256), f"z_rvq {z_rvq.shape}"
     assert codes_rvq.shape == (B, 750, 8), f"codes_rvq {codes_rvq.shape}"
     out_rvq = model_rvq(whisper_feat, wavlm_feat, muq_feat, mel, mel_mask)

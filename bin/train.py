@@ -212,6 +212,23 @@ def main():
     else:
         info_dict["discriminator"] = None
         info_dict["D_optimizer"] = None
+
+    # GPU-side feature extraction: when use_mel_extractor and feature_extraction_on_gpu, create extractor on rank GPU
+    dataset_conf = configs.get("dataset_conf", {})
+    use_mel_extractor = dataset_conf.get("use_mel_extractor", False)
+    feature_extraction_on_gpu = dataset_conf.get("feature_extraction_on_gpu", False)
+    if use_mel_extractor and feature_extraction_on_gpu:
+        from dataset.mel_to_features import CodecFeatureExtractor
+        fe_conf = dict(dataset_conf.get("feature_extractor", {}))
+        fe_conf["device"] = f"cuda:{rank}"
+        if fe_conf.get("wavlm_ckpt") == "":
+            fe_conf["wavlm_ckpt"] = None
+        info_dict["feature_extractor"] = CodecFeatureExtractor(**fe_conf)
+        if rank == 0:
+            logging.info(f"[Rank {rank}] GPU feature extractor created on cuda:{rank}")
+    else:
+        info_dict["feature_extractor"] = None
+
     save_model_opt(model, optimizer, "init", info_dict)
 
     executor = Executor()

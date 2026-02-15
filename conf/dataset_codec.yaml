@@ -5,10 +5,12 @@
 # Tar structure (from shard_48*): each sample = {id}_seg{NN}.json + {id}_seg{NN}.mel.npz
 # With use_mel_extractor: true, only mel.npz is loaded; whisper/wavlm/muq are computed on-the-fly from mel
 # (mel → waveform via inverse mel → Whisper/WavLM/MuQ). Use official/HF model names for default download.
+# feature_extraction_on_gpu: when true with use_mel_extractor, dataset returns only mel/mask; extraction runs on GPU in training (faster, no worker bottleneck). Default false = extract in DataLoader workers.
 
 urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w/shard_48*.tar"
 
 use_mel_extractor: true
+feature_extraction_on_gpu: true
 feature_extractor:
   device: "cuda"
   # All models: default download (Whisper → download_root; WavLM/MuQ → hf_cache_dir)

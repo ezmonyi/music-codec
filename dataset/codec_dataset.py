@@ -116,6 +116,38 @@ class CodecCollateFn:
         self.pad_value = pad_value
 
     def __call__(self, batch_list):
+        first = batch_list[0]
+        # Mel-only batch (GPU extraction path): only mel and mel_mask
+        if "whisper_feat" not in first:
+            mel_list = [b["mel"] for b in batch_list]
+            mask_list = [b["mel_mask"] for b in batch_list]
+            for i, feat in enumerate(mel_list):
+                if feat.dim() != 2:
+                    raise ValueError(f"mel[{i}] must be 2D (T, mel_dim), got shape {feat.shape}")
+                if feat.shape[1] != 128:
+                    logger.warning(f"mel[{i}] has unexpected mel_dim: expected 128, got {feat.shape[1]}")
+            t50 = max(x.shape[0] for x in mel_list)
+
+            def pad_50_mel(x):
+                if x.shape[0] < t50:
+                    pad = torch.full(
+                        (t50 - x.shape[0], x.shape[1]),
+                        self.pad_value,
+                        dtype=x.dtype,
+                    )
+                    return torch.cat([x, pad], dim=0)
+                return x[:t50]
+
+            def pad_mask_mel(x):
+                if x.shape[0] < t50:
+                    pad = torch.zeros(t50 - x.shape[0], dtype=x.dtype)
+                    return torch.cat([x, pad], dim=0)
+                return x[:t50]
+
+            mel = torch.stack([pad_50_mel(x) for x in mel_list])
+            mel_mask = torch.stack([pad_mask_mel(x) for x in mask_list])
+            return {"mel": mel, "mel_mask": mel_mask}
+
         w = [b["whisper_feat"] for b in batch_list]
         wl = [b["wavlm_feat"] for b in batch_list]
         m = [b["muq_feat"] for b in batch_list]
@@ -213,16 +245,9 @@ def _decode_npy_or_pt(data, key):
     return None
 
 
-def _align_and_crop_codec(whisper, wavlm, muq, mel, max_frames_50hz, rng):
-    """Align T50/T25 and optionally crop to max_frames_50hz.
-    
-    All inputs should be (T, D) shape. If mel has wrong shape, reshape it.
-    Expected mel shape: (T, mel_dim) where mel_dim is typically 128.
-    """
-    # Ensure mel is (T, mel_dim) - handle various input shapes
+def _normalize_mel_shape(mel):
+    """Normalize mel to (T, mel_dim) with mel_dim typically 128. Handles (T, D), (D, T), 3D, 4D."""
     original_shape = mel.shape
-    mel_dim_expected = 128  # Expected mel dimension
-    
     if mel.dim() == 2:
         # (T, mel_dim) or (mel_dim, T)
         # mel_dim is typically 128, T is typically > 1000
@@ -290,7 +315,27 @@ def _align_and_crop_codec(whisper, wavlm, muq, mel, max_frames_50hz, rng):
         # Likely (T, something_else), check if we need to transpose
         if mel.shape[0] < mel.shape[1]:
             mel = mel.transpose(0, 1)
+    return mel
+
+
+def _crop_mel_only(mel, max_frames_50hz, rng):
+    """Normalize mel to (T, mel_dim) and crop to max_frames_50hz. Returns (mel, mel_mask)."""
+    mel = _normalize_mel_shape(mel)
+    if max_frames_50hz > 0 and mel.shape[0] > max_frames_50hz:
+        start = rng.randint(0, mel.shape[0] - max_frames_50hz) if rng else 0
+        end = start + max_frames_50hz
+        mel = mel[start:end]
+    mel_mask = torch.ones(mel.shape[0], dtype=torch.float32)
+    return mel, mel_mask
+
+
+def _align_and_crop_codec(whisper, wavlm, muq, mel, max_frames_50hz, rng):
+    """Align T50/T25 and optionally crop to max_frames_50hz.
     
+    All inputs should be (T, D) shape. If mel has wrong shape, reshape it.
+    Expected mel shape: (T, mel_dim) where mel_dim is typically 128.
+    """
+    mel = _normalize_mel_shape(mel)
     t50 = min(whisper.shape[0], wavlm.shape[0], mel.shape[0])
     t25 = min(muq.shape[0], t50 // 2)
     t50 = t25 * 2
@@ -324,6 +369,7 @@ class CodecWebDataset(IterableDataset):
         use_mel_extractor=False,
         feature_extractor=None,
         feature_extractor_conf=None,
+        extract_on_gpu=False,
     ):
         if wds is None:
             raise ImportError("webdataset is required for CodecWebDataset; pip install webdataset")
@@ -337,6 +383,7 @@ class CodecWebDataset(IterableDataset):
             "mel": "mel.npz",
         }
         self.use_mel_extractor = use_mel_extractor
+        self.extract_on_gpu = extract_on_gpu  # when True, dataset returns only mel/mask; extraction runs on GPU in training
         self._feature_extractor = feature_extractor
         self._feature_extractor_conf = feature_extractor_conf or {}
         if isinstance(urls, str):
@@ -351,8 +398,8 @@ class CodecWebDataset(IterableDataset):
         self.rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else int(os.environ.get("RANK", 0))
         self.world_size = dist.get_world_size() if dist.is_available() and dist.is_initialized() else int(os.environ.get("WORLD_SIZE", 1))
         if self.rank == 0:
-            print("[INFO] CodecWebDataset: {} shards, world_size={}, use_mel_extractor={}".format(
-                len(self.urls), self.world_size, self.use_mel_extractor
+            print("[INFO] CodecWebDataset: {} shards, world_size={}, use_mel_extractor={}, extract_on_gpu={}".format(
+                len(self.urls), self.world_size, self.use_mel_extractor, self.extract_on_gpu
             ))
 
     def _get_feature_extractor(self):
@@ -374,6 +421,13 @@ class CodecWebDataset(IterableDataset):
         mel = _decode_npy_or_pt(sample.get(melk), melk)
         if mel is None:
             return None
+
+        # GPU extraction path: return only mel and mel_mask; extraction runs in training process on GPU
+        if self.extract_on_gpu:
+            mel, mel_mask = _crop_mel_only(mel, self.max_frames_50hz, self.rng)
+            if mel.dim() != 2 or mel.shape[1] != 128:
+                logger.warning(f"[CodecWebDataset] mel after _crop_mel_only: shape {mel.shape}")
+            return {"mel": mel, "mel_mask": mel_mask}
 
         if self.use_mel_extractor:
             extractor = self._get_feature_extractor()
@@ -470,8 +524,10 @@ def init_dataset_and_dataloader(args, configs):
             base = webdataset_path.rstrip("/")
             urls = os.path.join(base, shard_pattern)
         use_mel_extractor = dataset_conf.get("use_mel_extractor", False)
+        feature_extraction_on_gpu = dataset_conf.get("feature_extraction_on_gpu", False)
         feature_extractor_conf = dataset_conf.get("feature_extractor", {})
-        if use_mel_extractor and feature_extractor_conf:
+        extract_on_gpu = use_mel_extractor and feature_extraction_on_gpu
+        if use_mel_extractor and not extract_on_gpu and feature_extractor_conf:
             feature_extractor_conf = dict(feature_extractor_conf)
             num_workers = getattr(args, "num_workers", 4)
             # Force CPU in DataLoader workers to avoid cuFFT/OOM; main process moves batch to GPU
@@ -485,11 +541,12 @@ def init_dataset_and_dataloader(args, configs):
             seed=seed,
             feature_keys=dataset_conf.get("feature_keys"),
             use_mel_extractor=use_mel_extractor,
-            feature_extractor_conf=feature_extractor_conf if use_mel_extractor else None,
+            feature_extractor_conf=feature_extractor_conf if (use_mel_extractor and not extract_on_gpu) else None,
+            extract_on_gpu=extract_on_gpu,
         )
         num_workers_val = getattr(args, "num_workers", 4)
         logging.info(f"[DataLoader] Creating DataLoader: batch_size={batch_size}, num_workers={num_workers_val}, "
-                    f"use_mel_extractor={use_mel_extractor}")
+                    f"use_mel_extractor={use_mel_extractor}, extract_on_gpu={extract_on_gpu}")
         train_loader = torch.utils.data.DataLoader(
             train_dataset,
             batch_size=batch_size,

@@ -39,7 +39,9 @@ codec/
 
 ## 训练数据与特征
 
-- **仅 mel.npz**：若数据只有 `mel.npz`（无预计算 whisper/wavlm/muq），在 `dataset_codec.yaml` 中设置 `use_mel_extractor: true` 和 `feature_extractor`（含本地模型路径）。DataLoader 在取样本时用 `CodecFeatureExtractor` 将 mel 反演为波形，再跑 Whisper / WavLM / MuQ 得到特征，与 mel 对齐后送入模型。
+- **仅 mel.npz**：若数据只有 `mel.npz`（无预计算 whisper/wavlm/muq），在 `dataset_codec.yaml` 中设置 `use_mel_extractor: true` 和 `feature_extractor`（含本地模型路径）。  
+  - **DataLoader 内提取（默认）**：`feature_extraction_on_gpu: false` 时，DataLoader 在取样本时用 `CodecFeatureExtractor` 将 mel 反演为波形，再在 **CPU** 上跑 Whisper / WavLM / MuQ 得到特征，与 mel 对齐后送入模型。  
+  - **训练进程内 GPU 提取（推荐）**：设置 `feature_extraction_on_gpu: true` 时，DataLoader 只加载 mel（及 mel_mask），不创建特征提取器；训练进程在 **GPU** 上对每个 batch 运行 Whisper / WavLM / MuQ 后再送入模型。更快、避免 worker CPU 瓶颈与 IPC 开销。
 - **本地预训练模型**（示例）：
   - Whisper: `/mnt/yi-jfs/pretrained_models/whisper-large-v3`
   - WavLM: `/mnt/yi-jfs/pretrained_models/wavlm`（目录内 .pt）

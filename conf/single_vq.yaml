@@ -26,12 +26,13 @@ model: !new:model.AudioReconModel
   sigma: 1.0e-5
   time_scheduler: cos
   cond_scale_factor: 2
-  use_codebook_ema: false
+  use_codebook_ema: true
   ema_decay: 0.99
+  entropy_loss_weight: 10   # aggressive for experiment; must be in model section so model computes entropy loss
 
 train_conf:
   dtype: fp32
-  batch_size: 8
+  batch_size: 12
   # steps_per_epoch: 0   # 0 = no limit (iterate until exhausted). Set >0 (e.g. 5000) to fix epoch size so all DDP ranks stay in sync and avoid NCCL collective timeout with IterableDataset.
   optim: adamw
   optim_conf:
@@ -45,8 +46,9 @@ train_conf:
   accum_grad: 1
   log_interval: 50
   save_per_step: 2000
-  commit_loss_weight: 0.25
+  commit_loss_weight: 10
   codebook_loss_weight: 1.0   # used when RVQ (commit*0.25 + codebook*1.0, like SoundStream/mucodec)
+  entropy_loss_weight: 10   # codebook entropy loss (aggressive); also set in model: so model computes it
   # Mel reconstruction + MS-STFT discriminator (EnCodec-style); balancer balances mel_recon and disc_gen when use_disc
   mel_recon_weight: 0.0       # L1(pred_mel, gt_mel); 0 = off
   mel_recon_n_steps: 4        # ODE steps for pred_mel when mel_recon or disc enabled

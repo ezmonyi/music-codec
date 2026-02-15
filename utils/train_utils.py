@@ -22,6 +22,36 @@ from torch.utils.tensorboard import SummaryWriter
 from utils.scheduler import WarmupLR, ConstantLR
 
 
+def get_scheduled_vq_weights(step, info_dict):
+    """Compute commit_loss_weight and entropy_loss_weight with optional linear decay.
+
+    Config (in train_conf):
+      - commit_loss_weight_start, commit_loss_weight_end, commit_loss_decay_steps
+      - entropy_loss_weight_start, entropy_loss_weight_end, entropy_loss_decay_steps
+    If decay_steps is 0 or missing, use constant commit_loss_weight / entropy_loss_weight.
+    """
+    out = {}
+    # Commit loss weight schedule
+    start = info_dict.get("commit_loss_weight_start")
+    end = info_dict.get("commit_loss_weight_end")
+    decay_steps = info_dict.get("commit_loss_decay_steps", 0)
+    if decay_steps > 0 and start is not None and end is not None:
+        progress = min(1.0, step / decay_steps)
+        out["commit_loss_weight"] = end + (start - end) * (1.0 - progress)
+    else:
+        out["commit_loss_weight"] = info_dict.get("commit_loss_weight", 0.25)
+    # Entropy loss weight schedule
+    start = info_dict.get("entropy_loss_weight_start")
+    end = info_dict.get("entropy_loss_weight_end")
+    decay_steps = info_dict.get("entropy_loss_decay_steps", 0)
+    if decay_steps > 0 and start is not None and end is not None:
+        progress = min(1.0, step / decay_steps)
+        out["entropy_loss_weight"] = end + (start - end) * (1.0 - progress)
+    else:
+        out["entropy_loss_weight"] = info_dict.get("entropy_loss_weight", 0.0)
+    return out
+
+
 def init_distributed(args):
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -108,11 +138,22 @@ def save_model_opt(model, optimizer, name, info_dict):
         save_opt_path,
     )
     info_path = re.sub(r"\.pt$", ".yaml", save_model_path)
-    info_dict = dict(info_dict)
-    info_dict["save_time"] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+    info_dict_copy = dict(info_dict)
+    # Remove non-serializable objects before YAML dump
+    info_dict_copy.pop("feature_extractor", None)
+    info_dict_copy.pop("discriminator", None)
+    info_dict_copy.pop("D_optimizer", None)
+    info_dict_copy.pop("balancer", None)
+    info_dict_copy.pop("loss_dict", None)
+    info_dict_copy.pop("_pred_mel", None)
+    info_dict_copy.pop("_mel_recon_loss", None)
+    info_dict_copy.pop("_D_loss", None)
+    info_dict_copy.pop("_disc_gen_loss", None)
+    info_dict_copy.pop("codes_for_hist", None)
+    info_dict_copy["save_time"] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     import yaml
     with open(info_path, "w") as fout:
-        fout.write(yaml.dump(info_dict))
+        fout.write(yaml.dump(info_dict_copy))
     logging.info("[Rank {}] Checkpoint: save to checkpoint {}".format(rank, save_model_path))
 
 
@@ -180,7 +221,8 @@ def _mel_to_waveform_batch(mel_batch, sample_rate=24000, n_fft=1920, hop_length=
 
 
 def batch_forward(model, batch, info_dict):
-    """Codec: move batch to device, run model, compute flow_loss + commit_loss; optional mel_recon and disc."""
+    """Codec: move batch to device, run model, compute flow_loss + commit_loss; optional mel_recon and disc.
+    If batch has only mel and mel_mask (GPU extraction path), run feature extractor on GPU first."""
     device = torch.device("cuda:{}".format(int(os.environ.get("LOCAL_RANK", 0))))
     dtype = info_dict.get("dtype", "fp32")
     if dtype == "fp16":
@@ -190,11 +232,24 @@ def batch_forward(model, batch, info_dict):
     else:
         dtype = torch.float32
 
-    whisper_feat = batch["whisper_feat"].to(device, dtype=dtype)
-    wavlm_feat = batch["wavlm_feat"].to(device, dtype=dtype)
-    muq_feat = batch["muq_feat"].to(device, dtype=dtype)
     mel = batch["mel"].to(device, dtype=dtype)
     mel_mask = batch["mel_mask"].to(device)
+
+    if "whisper_feat" not in batch:
+        # GPU extraction path: run feature extractor on GPU
+        extractor = info_dict.get("feature_extractor")
+        if extractor is None:
+            raise RuntimeError("Batch has only mel/mel_mask but info_dict has no feature_extractor (set feature_extraction_on_gpu and use_mel_extractor in dataset_conf)")
+        with torch.no_grad():
+            whisper_feat, wavlm_feat, muq_feat = extractor.extract_batch(mel)
+        # Ensure same dtype as rest of forward
+        whisper_feat = whisper_feat.to(dtype)
+        wavlm_feat = wavlm_feat.to(dtype)
+        muq_feat = muq_feat.to(dtype)
+    else:
+        whisper_feat = batch["whisper_feat"].to(device, dtype=dtype)
+        wavlm_feat = batch["wavlm_feat"].to(device, dtype=dtype)
+        muq_feat = batch["muq_feat"].to(device, dtype=dtype)
 
     mel_recon_weight = info_dict.get("mel_recon_weight", 0.0)
     use_disc = info_dict.get("use_disc", False)
@@ -212,13 +267,21 @@ def batch_forward(model, batch, info_dict):
     flow_loss = (F.l1_loss(flow_pred, flow_gt, reduction="none").float() * mask).sum() / (
         mask.sum() * mel.shape[-1] + 1e-8
     )
+    flow_loss_weight = info_dict.get("flow_loss_weight", 0.1)
     commit_loss = out["commit_loss"]
     commit_weight = info_dict.get("commit_loss_weight", 0.25)
-    loss = flow_loss + commit_weight * commit_loss
+    loss = flow_loss_weight * flow_loss + commit_weight * commit_loss
     codebook_loss = out.get("codebook_loss")
     if codebook_loss is not None:
         codebook_weight = info_dict.get("codebook_loss_weight", 1.0)
         loss = loss + codebook_weight * codebook_loss
+    entropy_loss = out.get("entropy_loss")
+    if entropy_loss is not None:
+        # Get entropy_loss_weight from info_dict (config) or model
+        m = model.module if hasattr(model, "module") else model
+        entropy_loss_weight = info_dict.get("entropy_loss_weight", getattr(m, "entropy_loss_weight", 0.0))
+        if entropy_loss_weight > 0:
+            loss = loss + entropy_loss_weight * entropy_loss
 
     pred_mel = out.get("pred_mel")
     mel_recon_loss = None
@@ -271,13 +334,15 @@ def batch_forward(model, batch, info_dict):
     info_dict["codes_for_hist"] = codes.detach().flatten()
 
     loss_dict = {
-        "loss": loss,
-        "flow_loss": flow_loss,
+        "total_loss": loss,
+        "mel_reconstruction_loss": flow_loss,
         "commit_loss": commit_loss,
         "codebook_util": torch.tensor(codebook_util, device=loss.device, dtype=torch.float32),
     }
     if codebook_loss is not None:
         loss_dict["codebook_loss"] = codebook_loss
+    if entropy_loss is not None:
+        loss_dict["entropy_loss"] = entropy_loss
     if mel_recon_loss is not None:
         loss_dict["mel_recon_loss"] = mel_recon_loss
     if disc_gen_loss is not None:
@@ -298,9 +363,14 @@ def batch_backward(model, info_dict):
     discriminator = info_dict.get("discriminator")
 
     if balancer is not None and pred_mel is not None:
-        loss_main = loss_dict["flow_loss"] + info_dict.get("commit_loss_weight", 0.25) * loss_dict["commit_loss"]
+        loss_main = info_dict.get("flow_loss_weight", 0.1) * loss_dict["mel_reconstruction_loss"] + info_dict.get("commit_loss_weight", 0.25) * loss_dict["commit_loss"]
         if "codebook_loss" in loss_dict:
             loss_main = loss_main + info_dict.get("codebook_loss_weight", 1.0) * loss_dict["codebook_loss"]
+        if "entropy_loss" in loss_dict:
+            m = model.module if hasattr(model, "module") else model
+            entropy_loss_weight = info_dict.get("entropy_loss_weight", getattr(m, "entropy_loss_weight", 0.0))
+            if entropy_loss_weight > 0:
+                loss_main = loss_main + entropy_loss_weight * loss_dict["entropy_loss"]
         scaled_main = loss_main / accum_grad
         scaled_main.backward(retain_graph=True)
         bal_losses = {}
@@ -313,9 +383,9 @@ def batch_backward(model, info_dict):
         if discriminator is not None and "_D_loss" in info_dict:
             info_dict["_D_loss"].backward()
     else:
-        scaled_loss = loss_dict["loss"] / accum_grad
+        scaled_loss = loss_dict["total_loss"] / accum_grad
         scaled_loss.backward()
-        loss_dict["loss"] = scaled_loss
+        loss_dict["total_loss"] = scaled_loss
     return info_dict
 
 
