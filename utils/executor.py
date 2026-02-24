@@ -115,8 +115,9 @@ class Executor:
                         info_dict = batch_backward(model, info_dict)
 
                     if self.rank == 0:
+                        _s = lambda v: v.item() if torch.is_tensor(v) else v
                         msgs = [
-                            "{}={:.5f}".format(k, v.item())
+                            "{}={:.5f}".format(k, _s(v))
                             for k, v in info_dict["loss_dict"].items()
                         ]
                         pbar.set_postfix_str(";".join(msgs))

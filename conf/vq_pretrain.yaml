@@ -1,0 +1,73 @@
+# VQ pretraining config. Same model architecture as single_vq.yaml so that
+# exported checkpoints (encoder_vq_*.pt) are directly loadable by main training
+# via train_conf.restore_model_path with restore_load_encoder: true.
+#
+# Trains encoder (resamplers + in_proj) + VQ codebook as a feature autoencoder.
+# CFM is frozen during pretraining; its weights in the exported checkpoint are
+# just the random init (equivalent to starting from scratch in main training).
+#
+# Usage:
+#   ./bin/run_vq_pretrain.sh conf/vq_pretrain.yaml
+#   # then in single_vq.yaml: restore_model_path: /path/to/encoder_vq_epoch_X_step_Y.pt
+
+__set_seed1: !apply:random.seed [42]
+__set_seed2: !apply:numpy.random.seed [42]
+__set_seed3: !apply:torch.manual_seed [42]
+__set_seed4: !apply:torch.cuda.manual_seed_all [42]
+
+dataset_conf:
+  manifest_path: ""
+  max_frames_50hz: 1500
+  seed: 42
+
+# Model: identical to single_vq.yaml for checkpoint compatibility.
+# entropy_loss_weight must be >0 so that entropy loss is actually computed
+# inside _vq_quantize; the effective weight is controlled by train_conf below.
+model: !new:model.AudioReconModel
+  whisper_dim: 1280
+  wavlm_dim: 1024
+  muq_dim: 1024
+  codebook_size: 8192
+  codebook_dim: 256
+  in_proj_hidden_dims: [1024, 512]
+  in_proj_dropout: 0.1
+  mel_dim: 128
+  hidden_size: 1024
+  num_layers: 22
+  num_heads: 16
+  cfg_drop_prob: 0.2
+  sigma: 1.0e-5
+  time_scheduler: cos
+  cond_scale_factor: 2
+  use_codebook_ema: false
+  ema_decay: 0.99
+  entropy_loss_weight: 1.0   # passthrough; actual weight from train_conf.entropy_loss_weight
+  codebook_init_std: 0.02
+  codebook_init: "normal"
+  vq_pre_batch_norm: false
+
+train_conf:
+  dtype: fp32
+  batch_size: 16            # larger than joint training (no CFM forward/backward)
+  restore_model_path: null  # set to kmeans init checkpoint if desired
+  optim: adamw
+  optim_conf:
+    lr: 1.0e-3              # higher LR for faster VQ convergence
+  scheduler: warmuplr
+  scheduler_conf:
+    warmup_steps: 2000
+    last_epoch: -1
+  max_epoch: 20
+  grad_clip: 5.0
+  accum_grad: 1
+  log_interval: 50
+  save_per_step: 2000
+
+  # Loss weights (VQ pretrain specific)
+  recon_loss_weight: 1.0    # L1 feature reconstruction
+  commit_loss_weight: 1.0   # commitment loss (higher than joint training's 0.25)
+  entropy_loss_weight: 0.1  # entropy regularization for codebook utilization
+  codebook_loss_weight: 1.0 # codebook loss (RVQ only)
+
+  # Decoder MLP hidden dims (input=256, output=3328, throwaway after pretrain)
+  decoder_hidden_dims: [1024]

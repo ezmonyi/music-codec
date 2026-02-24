@@ -193,6 +193,9 @@ class AudioReconModel(nn.Module):
         use_codebook_ema: bool = False,
         ema_decay: float = 0.99,
         entropy_loss_weight: float = 0.0,
+        codebook_init_std: float = 0.02,
+        codebook_init: str = "normal",
+        vq_pre_batch_norm: bool = False,
     ):
         super().__init__()
 
@@ -225,6 +228,11 @@ class AudioReconModel(nn.Module):
 
         # ── Projection: concat → single-VQ dim or RVQ hidden dim ────────────────────
         out_dim = rvq_hidden_dim if use_rvq else codebook_dim
+        self.vq_pre_batch_norm = vq_pre_batch_norm
+        if vq_pre_batch_norm:
+            self.pre_vq_bn = nn.BatchNorm1d(out_dim)
+        else:
+            self.pre_vq_bn = None
         if not in_proj_hidden_dims:
             self.in_proj = nn.Linear(concat_dim, out_dim)
         else:
@@ -256,7 +264,7 @@ class AudioReconModel(nn.Module):
             self.vq_codebook = None
         else:
             self.vq_codebook = nn.Embedding(codebook_size, codebook_dim)
-            nn.init.normal_(self.vq_codebook.weight, mean=0.0, std=0.02)
+            self._init_codebook(self.vq_codebook.weight, codebook_init, codebook_init_std)
             self.rvq = None
             self.cond_proj = None
 
@@ -272,6 +280,21 @@ class AudioReconModel(nn.Module):
             sigma=sigma,
             time_scheduler=time_scheduler,
         )
+
+    @staticmethod
+    def _init_codebook(weight: torch.Tensor, init_type: str, std: float):
+        """Initialize codebook for better utilization.
+        - normal: Gaussian(0, std). Use larger std (e.g. 0.5, 1.0) to spread entries so more get used early.
+        - uniform_unit: sample normal then L2-normalize rows (uniform on sphere); scale by std for magnitude.
+        """
+        if init_type == "normal":
+            nn.init.normal_(weight, mean=0.0, std=std)
+        elif init_type == "uniform_unit":
+            nn.init.normal_(weight, mean=0.0, std=1.0)
+            with torch.no_grad():
+                weight.data = F.normalize(weight.data, dim=-1) * std
+        else:
+            nn.init.normal_(weight, mean=0.0, std=std)
 
     # ==================================================================
     #  VQ quantization
@@ -379,6 +402,9 @@ class AudioReconModel(nn.Module):
         m = m[:, :min_len, :]
         concat_feat = torch.cat([w, wl, m], dim=-1)  # (B, T, 3328)
         z_e = self.in_proj(concat_feat)
+        if self.pre_vq_bn is not None:
+            # BatchNorm1d expects (N, C, L); z_e is (B, T, D) -> (B, D, T)
+            z_e = self.pre_vq_bn(z_e.transpose(1, 2)).transpose(1, 2)
 
         if self.use_rvq:
             z_q_concat, codes, commitment_loss, codebook_loss, entropy_loss = self.rvq(z_e)
@@ -387,6 +413,21 @@ class AudioReconModel(nn.Module):
         else:
             z_q_st, codes, commit_loss, entropy_loss = self._vq_quantize(z_e)
             return z_q_st, codes, commit_loss, entropy_loss
+
+    def get_pre_vq_features(self, whisper_feat, wavlm_feat, muq_feat):
+        """Return encoder output z_e (B, T, codebook_dim) before VQ. For k-means codebook init."""
+        if whisper_feat.dim() != 3 or wavlm_feat.dim() != 3 or muq_feat.dim() != 3:
+            raise ValueError("All feature inputs must be 3D (B, T, D)")
+        w = self.whisper_resample(whisper_feat.transpose(1, 2)).transpose(1, 2)
+        wl = self.wavlm_resample(wavlm_feat.transpose(1, 2)).transpose(1, 2)
+        m = muq_feat
+        min_len = min(w.shape[1], wl.shape[1], m.shape[1])
+        w, wl, m = w[:, :min_len, :], wl[:, :min_len, :], m[:, :min_len, :]
+        concat_feat = torch.cat([w, wl, m], dim=-1)
+        z_e = self.in_proj(concat_feat)
+        if self.pre_vq_bn is not None:
+            z_e = self.pre_vq_bn(z_e.transpose(1, 2)).transpose(1, 2)
+        return z_e
 
     # ==================================================================
     #  Training forward

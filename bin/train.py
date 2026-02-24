@@ -59,12 +59,6 @@ def get_args():
     parser.add_argument("--local-rank", help="placeholder for DDP")
     parser.add_argument("--dataset_conf", required=True, help="dataset yaml or manifest path")
     parser.add_argument("--model_dir", required=True, help="save model dir")
-    parser.add_argument(
-        "--restore_model_path",
-        type=str,
-        default=None,
-        help="restore from this ckpt (overrides resume from model_dir)",
-    )
     parser.add_argument("--tensorboard_dir", default="tensorboard", help="tensorboard log dir")
     parser.add_argument(
         "--ddp.dist_backend",
@@ -152,10 +146,28 @@ def main():
             )
         )
 
-    if getattr(args, "restore_model_path", None) and os.path.isfile(args.restore_model_path):
-        ckpt = torch.load(args.restore_model_path, map_location="cpu")
-        model.load_state_dict(ckpt, strict=True)
-        print("Restore model from {}".format(args.restore_model_path))
+    restore_model_path = configs.get("train_conf", {}).get("restore_model_path")
+    restore_load_encoder = configs.get("train_conf", {}).get("restore_load_encoder", True)
+    if restore_model_path and os.path.isfile(restore_model_path):
+        ckpt = torch.load(restore_model_path, map_location="cpu")
+        if restore_load_encoder:
+            model.load_state_dict(ckpt, strict=True)
+            print("Restore model from {} (full model including encoder)".format(restore_model_path))
+        else:
+            # Load only codebook (skip conv1d/MLP - keep random init)
+            model_state = model.state_dict()
+            loaded_keys = []
+            skipped_keys = []
+            for k, v in ckpt.items():
+                if k in model_state and k == "vq_codebook.weight":
+                    model_state[k] = v
+                    loaded_keys.append(k)
+                elif k.startswith("whisper_resample") or k.startswith("wavlm_resample") or k.startswith("in_proj"):
+                    skipped_keys.append(k)
+            model.load_state_dict(model_state, strict=False)
+            print("Restore model from {} (codebook only, encoder kept random)".format(restore_model_path))
+            if skipped_keys:
+                print("  Skipped encoder layers: {}".format(", ".join(skipped_keys[:5]) + ("..." if len(skipped_keys) > 5 else "")))
 
     model = wrap_cuda_model(args, model)
 

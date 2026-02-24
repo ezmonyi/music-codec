@@ -23,14 +23,24 @@ from utils.scheduler import WarmupLR, ConstantLR
 
 
 def get_scheduled_vq_weights(step, info_dict):
-    """Compute commit_loss_weight and entropy_loss_weight with optional linear decay.
+    """Compute flow_loss_weight, commit_loss_weight and entropy_loss_weight with optional linear decay.
 
     Config (in train_conf):
+      - flow_loss_weight_start, flow_loss_weight_end, flow_loss_decay_steps
       - commit_loss_weight_start, commit_loss_weight_end, commit_loss_decay_steps
       - entropy_loss_weight_start, entropy_loss_weight_end, entropy_loss_decay_steps
-    If decay_steps is 0 or missing, use constant commit_loss_weight / entropy_loss_weight.
+    If decay_steps is 0 or missing, use constant weights.
     """
     out = {}
+    # Flow loss weight schedule (reconstruction loss - minimize early to focus on codebook)
+    start = info_dict.get("flow_loss_weight_start")
+    end = info_dict.get("flow_loss_weight_end")
+    decay_steps = info_dict.get("flow_loss_decay_steps", 0)
+    if decay_steps > 0 and start is not None and end is not None:
+        progress = min(1.0, step / decay_steps)
+        out["flow_loss_weight"] = end + (start - end) * (1.0 - progress)
+    else:
+        out["flow_loss_weight"] = info_dict.get("flow_loss_weight", 0.1)
     # Commit loss weight schedule
     start = info_dict.get("commit_loss_weight_start")
     end = info_dict.get("commit_loss_weight_end")
@@ -348,7 +358,7 @@ def batch_forward(model, batch, info_dict):
     if disc_gen_loss is not None:
         loss_dict["disc_gen_loss"] = disc_gen_loss
     if D_loss is not None:
-        loss_dict["D_loss"] = D_loss
+        loss_dict["disc_D_loss"] = D_loss  # discriminator loss (for TensorBoard / shell)
     info_dict["loss_dict"] = loss_dict
     return info_dict
 
@@ -406,6 +416,11 @@ def update_parameter_and_lr(model, optimizer, scheduler, info_dict):
     return info_dict
 
 
+def _loss_scalar(v):
+    """Convert loss value to Python scalar for logging (tensor or float)."""
+    return v.item() if torch.is_tensor(v) else v
+
+
 def log_per_step(writer, info_dict):
     tag = info_dict["tag"]
     step = info_dict["step"]
@@ -417,7 +432,7 @@ def log_per_step(writer, info_dict):
             for k in ["epoch", "lr", "grad_norm"]:
                 writer.add_scalar("{}/{}".format(tag, k), info_dict.get(k, 0), step + 1)
             for k, v in loss_dict.items():
-                writer.add_scalar("{}/{}".format(tag, k), v.item(), step + 1)
+                writer.add_scalar("{}/{}".format(tag, k), _loss_scalar(v), step + 1)
             # Code usage histogram: which code indices are used (spread vs collapse)
             if "codes_for_hist" in info_dict:
                 writer.add_histogram("vq/code_usage", info_dict["codes_for_hist"], step + 1)
@@ -425,7 +440,7 @@ def log_per_step(writer, info_dict):
     if (batch_idx + 1) % info_dict["log_interval"] == 0:
         log_str = "{} Batch {} ".format(tag, batch_idx + 1)
         for name, value in loss_dict.items():
-            log_str += "{} {:.6f} ".format(name, value.item())
+            log_str += "{} {:.6f} ".format(name, _loss_scalar(value))
         if tag == "TRAIN":
             log_str += "lr {:.8f} grad_norm {:.6f}".format(
                 info_dict["lr"], info_dict["grad_norm"]
@@ -440,9 +455,7 @@ def log_per_save(writer, info_dict):
     step = info_dict["step"]
     loss_dict = info_dict["loss_dict"]
     rank = int(os.environ.get("RANK", 0))
-    def _scalar(v):
-        return v.item() if torch.is_tensor(v) else v
-
+    _scalar = _loss_scalar
     logging.info(
         "Epoch {} Step {} CV info lr {} rank {} {}".format(
             epoch,

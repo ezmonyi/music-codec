@@ -1,5 +1,4 @@
-# Single VQ base config with all available options.
-# This serves as the reference template — toggle options as needed.
+# Ablation: EMA + fixed commit/entropy weights, no kmeans init, no discriminator, no schedule.
 
 __set_seed1: !apply:random.seed [42]
 __set_seed2: !apply:numpy.random.seed [42]
@@ -27,7 +26,7 @@ model: !new:model.AudioReconModel
   sigma: 1.0e-5
   time_scheduler: cos
   cond_scale_factor: 2
-  use_codebook_ema: false
+  use_codebook_ema: true
   ema_decay: 0.99
   entropy_loss_weight: 1.0
   codebook_init_std: 0.02
@@ -37,11 +36,7 @@ model: !new:model.AudioReconModel
 train_conf:
   dtype: fp32
   batch_size: 12
-
-  # Checkpoint restore
   restore_model_path: null
-  restore_load_encoder: false
-
   optim: adamw
   optim_conf:
     lr: 5.0e-4
@@ -54,32 +49,12 @@ train_conf:
   accum_grad: 1
   log_interval: 50
   save_per_step: 2000
-
-  # Flow loss (fixed weight; set _start/_end/_decay_steps to enable schedule)
   flow_loss_weight: 0.1
-  flow_loss_weight_start: 0.01
-  flow_loss_weight_end: 0.1
-  flow_loss_decay_steps: 15000
-
-  # Commit loss (fixed weight; set _start/_end/_decay_steps to enable schedule)
   commit_loss_weight: 0.25
-  commit_loss_weight_start: 0.05
-  commit_loss_weight_end: 0.5
-  commit_loss_decay_steps: 15000
-
   codebook_loss_weight: 1.0
-
-  # Entropy loss (fixed weight; set _start/_end/_decay_steps to enable schedule)
   entropy_loss_weight: 0.2
-  entropy_loss_weight_start: 100.0
-  entropy_loss_weight_end: 0.2
-  entropy_loss_decay_steps: 20000
-
-  # Mel reconstruction
   mel_recon_weight: 0.0
   mel_recon_n_steps: 4
-
-  # Discriminator
   use_disc: false
   disc_weight: 1.0
   disc_lr: 1.0e-4
@@ -87,8 +62,6 @@ train_conf:
   disc_n_ffts: [1024, 2048, 512]
   disc_hop_lengths: [256, 512, 128]
   disc_win_lengths: [1024, 2048, 512]
-
-  # Grad balancer
   balancer_weights:
     mel_recon: 1.0
     disc_gen: 1.0
