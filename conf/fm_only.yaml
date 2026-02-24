@@ -39,10 +39,11 @@ model: !new:model.AudioReconModel
   codebook_init_std: 0.02
   codebook_init: "normal"
   vq_pre_batch_norm: false
+  cfm_gradient_checkpointing: true   # reduce OOM (trades compute for memory)
 
 train_conf:
   dtype: fp32
-  batch_size: 12             # same as joint training (CFM is the memory bottleneck)
+  batch_size: 6               # lower than joint; use 4 if still OOM with gradient_checkpointing
   restore_model_path: null
   optim: adamw
   optim_conf:
@@ -57,3 +58,7 @@ train_conf:
   log_interval: 50
   save_per_step: 2000
   sigma: 1.0e-5              # flow matching sigma (matches model)
+
+  # Eval: every N steps run one batch (no grad), generate mel and log L1 recon loss
+  eval_mel_recon_every_steps: 100
+  eval_mel_recon_n_steps: 8  # ODE steps for eval generation (fewer = faster)

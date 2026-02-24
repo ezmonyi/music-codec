@@ -196,6 +196,7 @@ class AudioReconModel(nn.Module):
         codebook_init_std: float = 0.02,
         codebook_init: str = "normal",
         vq_pre_batch_norm: bool = False,
+        cfm_gradient_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -279,6 +280,7 @@ class AudioReconModel(nn.Module):
             cond_scale_factor=cond_scale_factor,
             sigma=sigma,
             time_scheduler=time_scheduler,
+            gradient_checkpointing=cfm_gradient_checkpointing,
         )
 
     @staticmethod

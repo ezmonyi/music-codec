@@ -213,6 +213,49 @@ def cosyvoice_join(group_join, info_dict):
     return False
 
 
+def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
+    """Run one batch through decode_from_features (no grad), return L1 mel recon loss.
+    Used for periodic eval logging when training the FM model (joint or fm_only).
+    """
+    device = torch.device("cuda:{}".format(int(os.environ.get("LOCAL_RANK", 0))))
+    dtype = info_dict.get("dtype", "fp32")
+    dtype = torch.float16 if dtype == "fp16" else torch.bfloat16 if dtype == "bf16" else torch.float32
+
+    mel = batch_dict["mel"].to(device, dtype=dtype)
+    mel_mask = batch_dict["mel_mask"].to(device)
+
+    if "whisper_feat" not in batch_dict:
+        extractor = info_dict.get("feature_extractor")
+        if extractor is None:
+            return None
+        with torch.no_grad():
+            whisper_feat, wavlm_feat, muq_feat = extractor.extract_batch(mel)
+        whisper_feat = whisper_feat.to(dtype)
+        wavlm_feat = wavlm_feat.to(dtype)
+        muq_feat = muq_feat.to(dtype)
+    else:
+        whisper_feat = batch_dict["whisper_feat"].to(device, dtype=dtype)
+        wavlm_feat = batch_dict["wavlm_feat"].to(device, dtype=dtype)
+        muq_feat = batch_dict["muq_feat"].to(device, dtype=dtype)
+
+    m = model.module if hasattr(model, "module") else model
+    m.eval()
+    try:
+        with torch.no_grad():
+            pred_mel, _ = m.decode_from_features(
+                whisper_feat, wavlm_feat, muq_feat,
+                mel_mask=mel_mask,
+                n_timesteps=n_steps,
+                cfg=0.0,
+            )
+            loss = (
+                F.l1_loss(pred_mel, mel, reduction="none").float() * mel_mask.unsqueeze(-1)
+            ).sum() / (mel_mask.sum() * mel.shape[-1] + 1e-8)
+            return loss.item()
+    finally:
+        m.train()
+
+
 def _mel_to_waveform_batch(mel_batch, sample_rate=24000, n_fft=1920, hop_length=480, n_mels=128):
     """(B, T, F) mel -> (B, 1, T_wav) waveform. Uses Griffin-Lim per item."""
     from dataset.mel_to_features import mel_to_waveform
@@ -345,7 +388,7 @@ def batch_forward(model, batch, info_dict):
 
     loss_dict = {
         "total_loss": loss,
-        "mel_reconstruction_loss": flow_loss,
+        "flow_matching_loss": flow_loss,
         "commit_loss": commit_loss,
         "codebook_util": torch.tensor(codebook_util, device=loss.device, dtype=torch.float32),
     }
@@ -373,7 +416,7 @@ def batch_backward(model, info_dict):
     discriminator = info_dict.get("discriminator")
 
     if balancer is not None and pred_mel is not None:
-        loss_main = info_dict.get("flow_loss_weight", 0.1) * loss_dict["mel_reconstruction_loss"] + info_dict.get("commit_loss_weight", 0.25) * loss_dict["commit_loss"]
+        loss_main = info_dict.get("flow_loss_weight", 0.1) * loss_dict["flow_matching_loss"] + info_dict.get("commit_loss_weight", 0.25) * loss_dict["commit_loss"]
         if "codebook_loss" in loss_dict:
             loss_main = loss_main + info_dict.get("codebook_loss_weight", 1.0) * loss_dict["codebook_loss"]
         if "entropy_loss" in loss_dict:

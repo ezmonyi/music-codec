@@ -55,6 +55,10 @@ train_conf:
   log_interval: 50
   save_per_step: 2000
 
+  # Eval: every N steps run one batch (no grad), decode to mel and log L1 recon loss to TensorBoard
+  eval_mel_recon_every_steps: 100
+  eval_mel_recon_n_steps: 8
+
   # Flow loss (fixed weight; set _start/_end/_decay_steps to enable schedule)
   flow_loss_weight: 0.1
   flow_loss_weight_start: 0.01

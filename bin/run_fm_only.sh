@@ -45,8 +45,8 @@ gpus_per_node="${gpus_per_node:-8}"
 master_addr="${master_addr:-127.0.0.1}"
 master_port="${master_port:-29500}"
 
-# Data / training
-batch_size="${batch_size:-12}"
+# Data / training (default 6 for FM-only; use 4 if OOM)
+batch_size="${batch_size:-6}"
 num_workers="${num_workers:-8}"
 prefetch="${prefetch:-4}"
 timeout="${timeout:-300}"

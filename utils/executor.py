@@ -18,6 +18,7 @@ from utils.train_utils import (
     save_model_opt,
     cosyvoice_join,
     get_scheduled_vq_weights,
+    compute_eval_mel_recon_loss,
 )
 
 
@@ -148,6 +149,22 @@ class Executor:
                         self.step += 1
                         if self.rank == 0:
                             pbar.update(1)  # Update progress bar after gradient accumulation step
+
+                        # Eval: mel reconstruction loss every N steps (TensorBoard)
+                        eval_every = info_dict.get("eval_mel_recon_every_steps", 0)
+                        if (
+                            eval_every > 0
+                            and self.step % eval_every == 0
+                            and writer is not None
+                        ):
+                            n_steps = info_dict.get("eval_mel_recon_n_steps", 8)
+                            mel_recon = compute_eval_mel_recon_loss(
+                                model, batch_dict, info_dict, n_steps=n_steps
+                            )
+                            if mel_recon is not None:
+                                writer.add_scalar(
+                                    "eval/mel_recon_loss", mel_recon, self.step
+                                )
         
         # Close progress bar and log completion
         if self.rank == 0:

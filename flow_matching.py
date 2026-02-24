@@ -37,6 +37,7 @@ class FlowMatchingTransformer(nn.Module):
         cond_scale_factor=2,
         sigma=1e-5,
         time_scheduler="cos",
+        gradient_checkpointing=False,
     ):
         super().__init__()
 
@@ -79,6 +80,8 @@ class FlowMatchingTransformer(nn.Module):
             num_heads=num_heads,
             num_layers=num_layers,
         )
+        if gradient_checkpointing:
+            self.diff_estimator.gradient_checkpointing_enable()
 
         self.reset_parameters()
 

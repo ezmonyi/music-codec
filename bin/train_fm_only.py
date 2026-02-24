@@ -261,6 +261,10 @@ def main():
     grad_clip = train_conf.get("grad_clip", 5.0)
     steps_per_epoch = train_conf.get("steps_per_epoch", 0)
     sigma = train_conf.get("sigma", 1e-5)
+    eval_mel_recon_every_steps = train_conf.get(
+        "eval_mel_recon_every_steps", 100
+    )
+    eval_mel_recon_n_steps = train_conf.get("eval_mel_recon_n_steps", 8)
     dtype_str = train_conf.get("dtype", "fp32")
     dtype = {"fp16": torch.float16, "bf16": torch.bfloat16}.get(
         dtype_str, torch.float32
@@ -405,7 +409,7 @@ def main():
                         # TensorBoard
                         if writer and step % log_interval == 0:
                             writer.add_scalar(
-                                "train/flow_loss", flow_loss.item(), step
+                                "train/flow_matching_loss", flow_loss.item(), step
                             )
                             writer.add_scalar(
                                 "train/lr",
@@ -418,6 +422,40 @@ def main():
                                 else grad_norm
                             )
                             writer.add_scalar("train/grad_norm", gn, step)
+
+                        # Test batch: mel reconstruction loss (eval, no grad)
+                        if (
+                            writer
+                            and eval_mel_recon_every_steps > 0
+                            and step % eval_mel_recon_every_steps == 0
+                        ):
+                            base = wrapper.module.model
+                            base.eval()
+                            with torch.no_grad():
+                                z_e = base.get_pre_vq_features(wf, wlf, mf)
+                                cond = base.cfm.process_cond(
+                                    z_e, target_len=mel.shape[1]
+                                )
+                                pred_mel = base.cfm.reverse_diffusion(
+                                    cond,
+                                    mel_mask,
+                                    n_timesteps=eval_mel_recon_n_steps,
+                                    cfg=0.0,
+                                )
+                                mel_recon_loss = (
+                                    F.l1_loss(
+                                        pred_mel, mel, reduction="none"
+                                    ).float()
+                                    * mel_mask.unsqueeze(-1)
+                                ).sum() / (
+                                    mel_mask.sum() * mel.shape[-1] + 1e-8
+                                )
+                                writer.add_scalar(
+                                    "eval/mel_recon_loss",
+                                    mel_recon_loss.item(),
+                                    step,
+                                )
+                            base.train()
 
                         # Periodic checkpoint
                         if save_per_step > 0 and step % save_per_step == 0:

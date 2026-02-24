@@ -49,6 +49,8 @@ train_conf:
   accum_grad: 1
   log_interval: 50
   save_per_step: 2000
+  eval_mel_recon_every_steps: 100
+  eval_mel_recon_n_steps: 8
   flow_loss_weight: 0.1
   commit_loss_weight: 0.25
   codebook_loss_weight: 1.0

@@ -309,15 +309,32 @@ class DiffLlama(LlamaModel):
                 past_key_values[idx] if past_key_values is not None else None
             )
 
-            layer_outputs = decoder_layer(
-                hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=past_key_value,
-                output_attentions=output_attentions,
-                use_cache=use_cache,
-                cond_embedding=diffusion_step,
-            )
+            if self.gradient_checkpointing and self.training:
+                def _layer_forward(hidden_states):
+                    return decoder_layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        position_ids=position_ids,
+                        past_key_value=past_key_value,
+                        output_attentions=output_attentions,
+                        use_cache=use_cache,
+                        cond_embedding=diffusion_step,
+                    )
+                layer_outputs = torch.utils.checkpoint.checkpoint(
+                    _layer_forward,
+                    hidden_states,
+                    use_reentrant=False,
+                )
+            else:
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_value,
+                    output_attentions=output_attentions,
+                    use_cache=use_cache,
+                    cond_embedding=diffusion_step,
+                )
 
             hidden_states = layer_outputs[0]
 
