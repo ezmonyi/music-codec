@@ -43,7 +43,7 @@ from utils.train_utils import (
     check_modify_and_save_config,
 )
 from utils.executor import Executor
-from dataset.codec_dataset import init_dataset_and_dataloader
+from dataset.audio_webdataset import init_dataset_and_dataloader
 
 
 def get_args():
@@ -196,50 +196,12 @@ def main():
     info_dict = deepcopy(configs["train_conf"])
     info_dict["step"] = last_step
     info_dict["epoch"] = last_epoch
-    train_conf = configs["train_conf"]
-    mel_recon_weight = train_conf.get("mel_recon_weight", 0.0)
-    use_disc = train_conf.get("use_disc", False)
-    if use_disc:
-        from utils.balancer import Balancer
-        bw = train_conf.get("balancer_weights", {"mel_recon": 1.0, "disc_gen": 1.0})
-        info_dict["balancer"] = Balancer(
-            bw,
-            rescale_grads=train_conf.get("balancer_rescale_grads", True),
-            total_norm=train_conf.get("balancer_total_norm", 1.0),
-            ema_decay=train_conf.get("balancer_ema_decay", 0.999),
-        )
-    else:
-        info_dict["balancer"] = None
-    if use_disc:
-        from utils.ms_stft_disc import MultiScaleSTFTDiscriminator
-        disc = MultiScaleSTFTDiscriminator(
-            filters=train_conf.get("disc_filters", 32),
-            n_ffts=train_conf.get("disc_n_ffts", [1024, 2048, 512]),
-            hop_lengths=train_conf.get("disc_hop_lengths", [256, 512, 128]),
-            win_lengths=train_conf.get("disc_win_lengths", [1024, 2048, 512]),
-        )
-        disc = disc.cuda().train()
-        info_dict["discriminator"] = disc
-        info_dict["D_optimizer"] = optim.Adam(disc.parameters(), lr=train_conf.get("disc_lr", 1e-4))
-    else:
-        info_dict["discriminator"] = None
-        info_dict["D_optimizer"] = None
 
-    # GPU-side feature extraction: when use_mel_extractor and feature_extraction_on_gpu, create extractor on rank GPU
-    dataset_conf = configs.get("dataset_conf", {})
-    use_mel_extractor = dataset_conf.get("use_mel_extractor", False)
-    feature_extraction_on_gpu = dataset_conf.get("feature_extraction_on_gpu", False)
-    if use_mel_extractor and feature_extraction_on_gpu:
-        from dataset.mel_to_features import CodecFeatureExtractor
-        fe_conf = dict(dataset_conf.get("feature_extractor", {}))
-        fe_conf["device"] = f"cuda:{rank}"
-        if fe_conf.get("wavlm_ckpt") == "":
-            fe_conf["wavlm_ckpt"] = None
-        info_dict["feature_extractor"] = CodecFeatureExtractor(**fe_conf)
-        if rank == 0:
-            logging.info(f"[Rank {rank}] GPU feature extractor created on cuda:{rank}")
-    else:
-        info_dict["feature_extractor"] = None
+    # Always use GPU-side feature extraction (whisper/wavlm/muq from audio or mel)
+    from dataset.mel_to_features import CodecFeatureExtractor
+    info_dict["feature_extractor"] = CodecFeatureExtractor()
+    if rank == 0:
+        logging.info(f"[Rank {rank}] GPU feature extractor created on cuda:{rank}")
 
     save_model_opt(model, optimizer, "init", info_dict)
 

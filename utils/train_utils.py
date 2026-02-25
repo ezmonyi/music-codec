@@ -224,7 +224,25 @@ def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
     mel = batch_dict["mel"].to(device, dtype=dtype)
     mel_mask = batch_dict["mel_mask"].to(device)
 
-    if "whisper_feat" not in batch_dict:
+    if "audio" in batch_dict:
+        extractor = info_dict.get("feature_extractor")
+        if extractor is None:
+            return None
+        audio = batch_dict["audio"].to(device)
+        sr = batch_dict["sample_rate"][0].item()
+        wf_l, wlf_l, mf_l = [], [], []
+        with torch.no_grad():
+            for i in range(audio.shape[0]):
+                w, wl, m_ = extractor.extract_from_waveform(
+                    audio[i], sr, T_mel=mel.shape[1]
+                )
+                wf_l.append(w)
+                wlf_l.append(wl)
+                mf_l.append(m_)
+        whisper_feat = torch.stack(wf_l).to(dtype)
+        wavlm_feat = torch.stack(wlf_l).to(dtype)
+        muq_feat = torch.stack(mf_l).to(dtype)
+    elif "whisper_feat" not in batch_dict:
         extractor = info_dict.get("feature_extractor")
         if extractor is None:
             return None
@@ -288,22 +306,26 @@ def batch_forward(model, batch, info_dict):
     mel = batch["mel"].to(device, dtype=dtype)
     mel_mask = batch["mel_mask"].to(device)
 
-    if "whisper_feat" not in batch:
-        # GPU extraction path: run feature extractor on GPU
-        extractor = info_dict.get("feature_extractor")
-        if extractor is None:
-            raise RuntimeError("Batch has only mel/mel_mask but info_dict has no feature_extractor (set feature_extraction_on_gpu and use_mel_extractor in dataset_conf)")
-        with torch.no_grad():
-            whisper_feat, wavlm_feat, muq_feat = extractor.extract_batch(mel)
-        # Ensure same dtype as rest of forward
-        whisper_feat = whisper_feat.to(dtype)
-        wavlm_feat = wavlm_feat.to(dtype)
-        muq_feat = muq_feat.to(dtype)
-    else:
-        whisper_feat = batch["whisper_feat"].to(device, dtype=dtype)
-        wavlm_feat = batch["wavlm_feat"].to(device, dtype=dtype)
-        muq_feat = batch["muq_feat"].to(device, dtype=dtype)
-
+    extractor = info_dict.get("feature_extractor")
+    if extractor is None:
+        raise RuntimeError(
+            "Batch has audio but info_dict has no feature_extractor "
+            "(set feature_extractor config in dataset_conf)"
+        )
+    audio = batch["audio"].to(device)
+    sr = batch["sample_rate"][0].item()
+    wf_l, wlf_l, mf_l = [], [], []
+    with torch.no_grad():
+        for i in range(audio.shape[0]):
+            w, wl, m_ = extractor.extract_from_waveform(
+                audio[i], sr, T_mel=mel.shape[1]
+            )
+            wf_l.append(w)
+            wlf_l.append(wl)
+            mf_l.append(m_)
+    whisper_feat = torch.stack(wf_l).to(dtype)
+    wavlm_feat = torch.stack(wlf_l).to(dtype)
+    muq_feat = torch.stack(mf_l).to(dtype)
     mel_recon_weight = info_dict.get("mel_recon_weight", 0.0)
     use_disc = info_dict.get("use_disc", False)
     mel_recon_n_steps = info_dict.get("mel_recon_n_steps", 4)
@@ -338,37 +360,13 @@ def batch_forward(model, batch, info_dict):
 
     pred_mel = out.get("pred_mel")
     mel_recon_loss = None
-    disc_gen_loss = None
-    D_loss = None
     if need_pred_mel and pred_mel is not None:
         mel_recon_loss = (F.l1_loss(pred_mel, mel, reduction="none") * mel_mask.unsqueeze(-1)).sum() / (
             mel_mask.sum() * mel.shape[-1] + 1e-8
         )
-        if mel_recon_weight > 0 and not use_disc:
-            loss = loss + mel_recon_weight * mel_recon_loss
-        if use_disc:
-            discriminator = info_dict.get("discriminator")
-            if discriminator is not None:
-                sr = info_dict.get("mel_sample_rate", 24000)
-                n_fft = info_dict.get("mel_n_fft", 1920)
-                hop = info_dict.get("mel_hop_length", 480)
-                pred_wav = _mel_to_waveform_batch(pred_mel, sample_rate=sr, n_fft=n_fft, hop_length=hop)
-                with torch.no_grad():
-                    gt_wav = _mel_to_waveform_batch(mel, sample_rate=sr, n_fft=n_fft, hop_length=hop)
-                logits_real, _ = discriminator(gt_wav.detach())
-                logits_fake, _ = discriminator(pred_wav)
-                D_loss = 0.0
-                for lr, lf in zip(logits_real, logits_fake):
-                    D_loss = D_loss + F.relu(1 - lr).mean() + F.relu(1 + lf).mean()
-                D_loss = D_loss / max(len(logits_real), 1)
-                disc_gen_loss = 0.0
-                for lf in logits_fake:
-                    disc_gen_loss = disc_gen_loss - lf.mean()
-                disc_gen_loss = disc_gen_loss / max(len(logits_fake), 1)
-                info_dict["_D_loss"] = D_loss
-                info_dict["_disc_gen_loss"] = disc_gen_loss
-            info_dict["_pred_mel"] = pred_mel
-            info_dict["_mel_recon_loss"] = mel_recon_loss
+        loss = loss + mel_recon_weight * mel_recon_loss
+        info_dict["_pred_mel"] = pred_mel
+        info_dict["_mel_recon_loss"] = mel_recon_loss
 
     # Codebook utilization
     codes = out["codes"]

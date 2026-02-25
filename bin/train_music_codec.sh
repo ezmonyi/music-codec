@@ -23,6 +23,8 @@ export OMP_NUM_THREADS=16
 # Override: model_dir=/path ./bin/train_music_codec.sh conf/single_vq.yaml
 config_yaml="${1:-conf/single_vq.yaml}"
 exp_name="${exp_name:-$(date +"%y%m%d_%H%M")}"
+# Collapse any double (or more) underscores so dir names stay clean (e.g. 260224__143 -> 260224_143)
+while [[ "${exp_name}" == *"__"* ]]; do exp_name="${exp_name//__/_}"; done
 
 # Resolve config path and conf_name (basename without .yaml) for dirs
 conf="${config_yaml}"

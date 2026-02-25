@@ -127,7 +127,7 @@ code/codec/
 ├── config.yaml           # 模型超参数配置
 │
 ├── dataset/
-│   ├── codec_dataset.py   # CodecDataset, CodecWebDataset, init_dataset_and_dataloader
+│   ├── audio_webdataset.py   # CodecDataset, AudioWebDataset, init_dataset_and_dataloader
 │   └── mel_to_features.py # 训练时 mel→波形→Whisper/WavLM/MuQ 在线特征（CodecFeatureExtractor）
 ├── whisper_feature.py    # Whisper 特征提取脚本
 ├── wavlm_feature.py      # WavLM 特征提取脚本

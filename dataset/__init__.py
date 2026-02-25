@@ -1,5 +1,13 @@
-# Codec dataset: precomputed whisper/wavlm/muq features + mel
+# Codec dataset: AudioWebDataset (tar shards) only
 
-from dataset.codec_dataset import CodecDataset, CodecCollateFn, init_dataset_and_dataloader
+from dataset.audio_webdataset import (
+    AudioWebDataset,
+    AudioCollateFn,
+    init_dataset_and_dataloader,
+)
 
-__all__ = ["CodecDataset", "CodecCollateFn", "init_dataset_and_dataloader"]
+__all__ = [
+    "AudioWebDataset",
+    "AudioCollateFn",
+    "init_dataset_and_dataloader",
+]

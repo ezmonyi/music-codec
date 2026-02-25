@@ -130,7 +130,7 @@ codec/
 │   ├── executor.py            # 一 epoch 训练 + CV
 │   └── scheduler.py           # WarmupLR, ConstantLR
 ├── dataset/
-│   ├── codec_dataset.py       # CodecDataset、CodecWebDataset、init_dataset_and_dataloader
+│   ├── audio_webdataset.py    # CodecDataset、AudioWebDataset、CodecCollateFn、AudioCollateFn、init_dataset_and_dataloader
 │   └── mel_to_features.py     # mel→波形→Whisper/WavLM/MuQ 在线特征提取（CodecFeatureExtractor）
 └── model.py, flow_matching.py, ...
 ```

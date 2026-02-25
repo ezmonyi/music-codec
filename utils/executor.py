@@ -88,12 +88,6 @@ class Executor:
                     # Fixed epoch size: keep all ranks in sync to avoid NCCL collective timeout
                     if steps_per_epoch > 0 and batch_idx >= steps_per_epoch:
                         break
-                    if batch_idx == 0:
-                        logging.info(f"[Rank {self.rank}] First batch loaded, batch keys: {list(batch_dict.keys())}")
-                        if "whisper_feat" in batch_dict:
-                            logging.info(f"[Rank {self.rank}] Batch shapes - whisper: {batch_dict['whisper_feat'].shape}, "
-                                        f"wavlm: {batch_dict['wavlm_feat'].shape}, muq: {batch_dict['muq_feat'].shape}, "
-                                        f"mel: {batch_dict['mel'].shape}")
                     info_dict["tag"] = "TRAIN"
                     info_dict["step"] = self.step
                     info_dict["epoch"] = self.epoch
