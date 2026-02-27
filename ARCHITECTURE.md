@@ -1,6 +1,6 @@
 # Audio Reconstruction CFM Model
 
-> 基于 SoulX-Singer 的 DiffLlama CFM 架构，构建音频重建 codec 模型。3 路特征 resample 到 25Hz 后 concat，经 in_proj 压缩到 256 维由单个 VQ 量化，256 维 codebook embedding 直接传入 FlowMatchingTransformer，由其内部完成投影和上采样，预测 mel 频谱。
+> 基于 SoulX-Singer 的 DiffLlama CFM 架构，构建音频重建 codec 模型。3 路特征 resample 到 25Hz 后 concat，经 in_proj 压缩到 256 维由单个 VQ 量化，256 维 codebook embedding 传入 FlowMatchingTransformer，经 cond_emb 投影后通过 **Cross Attention** 与 mel 交互（不再上采样），由 DiT 预测 mel 频谱。
 
 ## 架构总览
 
@@ -25,13 +25,13 @@ flowchart TD
         VQ -->|"z_q_st (B,750,256)"| CFM
     end
 
-    subgraph cfm [FlowMatchingTransformer - reused as-is]
-        CFM["cond_emb: Linear 256 to 1024"] --> RESAMP["resampling_layers\n25Hz to 50Hz"]
-        RESAMP -->|"cond (B,1500,1024)"| LLAMA["DiffLlama\nmel=128, hidden=1024\n16 heads, N layers"]
+    subgraph cfm [FlowMatchingTransformer - DiT + Cross Attention]
+        CFM["cond_emb: Linear 256 to 1024"] -->|"cond (B,750,1024)"| DIT["DiT\nmel input + Cross Attention to cond"]
+        DIT -->|"mel_pred (B,1500,128)"| OUT
     end
     
     subgraph output [Output]
-        LLAMA -->|"mel_pred (B,1500,128)"| VOC["Vocos Vocoder\nhop=480, sr=24kHz"]
+        OUT --> VOC["Vocos Vocoder\nhop=480, sr=24kHz"]
         VOC --> AUDIO["Waveform\n(B, 720000)"]
     end
 ```
@@ -40,6 +40,7 @@ flowchart TD
 
 - **先 Concat 再 VQ / RVQ**: 3 路特征各自 resample 到 25Hz 后，在特征维度 concat 成 (B, 750, 3328)，经 `in_proj` 压缩到 256 维（单层 VQ）或 `rvq_hidden_dim`（RVQ）。`in_proj` 可为单层 Linear 或多层 MLP：当配置 `in_proj_hidden_dims` 非空时（如 [1024, 512]）为 concat_dim → … → codebook_dim / rvq_hidden_dim 的 MLP（GELU + 可选 dropout），未配置时退化为单层 Linear。每帧单层 VQ 产生一个 token；RVQ 产生 n_layers 个 token（时间对齐后 concat 再 cond_proj 进 CFM）。
 - **单层 VQ → CFM**: 256 维 codebook embedding（straight-through）直接作为 CFM 的 `cond_code`。**RVQ**：各层 16 维量化向量按时间对齐 concat 成 (B, T, n*16)，经 `cond_proj` 映射到 256 维再进 CFM，CFM 内部仍为 `cond_emb = nn.Linear(256, 1024)`。
+- **Cross Attention 条件注入**：condition 不再上采样到 mel 帧率，而是保持 (B, T_cond, hidden_size)。DiT 在每个 block 内通过 Cross Attention 让 mel 序列（Q）attend 到 cond（K/V），T_cond 与 T_mel 可不同。推理时 `T_mel = T_cond * cond_scale_factor`。
 - **VQ / RVQ 端到端训练**: 重建梯度通过 CFM → straight-through → in_proj 反传。单层 VQ 仅 commitment loss；RVQ 与 SoundStream / mucodec 对齐：**commitment loss**（encoder 拉向 codebook）+ **codebook loss**（codebook 拉向 encoder），可选 **L2 归一化** lookup（Improved VQGAN），权重通常为 0.25 * commitment + 1.0 * codebook。
 - **无 Prompt 机制**: codec 重建不需要参考音频 prompt。CFG dropout 保留用于推理引导。
 - **从 codes 推理**: 单层 VQ：`codes (B,T) → vq_codebook(codes)` → 256 维 → CFM。RVQ：`codes (B,T,n_layers) → rvq.lookup_codes(codes)` → concat 向量 → cond_proj → 256 维 → CFM。
@@ -66,10 +67,9 @@ muq_feat    (B, 750,1024) ──identity────┘       │
                                          z_q_st (B,750,256)
                                                │
                               FlowMatchingTransformer.forward()
-                                 cond_emb: 256 → 1024
-                                 upsample: 25Hz → 50Hz
+                                 cond_emb: 256 → 1024 (cond 保持 T_cond)
                                  forward_diffusion(mel, t)
-                                 DiffLlama(xt, t, cond)
+                                 DiT(xt, t, cond)  # cross attention 条件注入
                                                │
                               flow_pred (B,1500,128) + flow_gt
                                                │
@@ -82,9 +82,9 @@ muq_feat    (B, 750,1024) ──identity────┘       │
 codes (B, 750) ──vq_codebook lookup──→ z_q (B, 750, 256)
                                             │
                           FlowMatchingTransformer.generate()
-                             cond_emb: 256 → 1024
-                             upsample: 25Hz → 50Hz
+                             cond_emb: 256 → 1024 (cond 保持 T_cond)
                              Euler ODE: N steps, CFG
+                             T_mel = T_cond * cond_scale_factor
                                             │
                                   mel (B, 1500, 128)
                                             │
@@ -164,7 +164,8 @@ code/codec/
 | hidden_size | 1024 | DiffLlama 隐藏维度 |
 | num_layers | 22 | DiffLlama Transformer 层数 |
 | num_heads | 16 | 注意力头数 |
-| cond_scale_factor | 2 | 条件上采样倍率（25Hz → 50Hz） |
+| cond_scale_factor | 2 | 推理时 mel 帧数与 cond 帧数之比（T_mel = T_cond × cond_scale_factor） |
+| use_flash_attn_3 | false | DiT 是否使用 Flash Attention 3（需 flash-attn≥2.7、Hopper GPU） |
 | cfg_drop_prob | 0.2 | CFG dropout 概率 |
 | time_scheduler | cos | 时间步余弦调度 |
 | n_timesteps | 32 | 推理 Euler 步数 |
@@ -173,7 +174,16 @@ code/codec/
 | commit_loss_weight | 0.25 | 训练时 commitment loss 权重 |
 | codebook_loss_weight | 1.0 | 训练时 codebook loss 权重（仅 RVQ） |
 
+## DiT  backbone（CosyVoice 风格）
+
+FlowMatchingTransformer 使用 DiT（Diffusion Transformer）作为 flow 速度估计器：
+
+- **InputEmbedding**：仅投影 mel `(B, T_mel, mel_dim)` 到 model dim，不再拼接 cond。
+- **Cross Attention**：每个 DiTBlock 内含 Self-Attention + Cross-Attention + FFN。Cross-Attention 中 Q 来自 mel 隐藏状态，K/V 来自 cond，支持 `cond_mask` 屏蔽 padding。
+- **Flash Attention 3（可选）**：设置 `use_flash_attn_3=True` 时，DiT 使用 `FlashAttn3Processor`，需 `flash-attn >= 2.7` 及 Hopper GPU（H100/H800）。padding 通过 `flash_attn_varlen_func` 正确处理。
+
 ## 依赖
 
 - `torch >= 2.0`
 - `transformers == 4.41.2`（与 SoulX-Singer 保持一致）
+- `flash-attn >= 2.7`（可选，仅当 `use_flash_attn_3=True` 时需安装）

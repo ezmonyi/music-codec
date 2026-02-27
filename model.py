@@ -478,7 +478,7 @@ class AudioReconModel(nn.Module):
             out["commit_loss"] = vq_losses[0]
             out["entropy_loss"] = vq_losses[1]
         if return_pred_mel:
-            cond = self.cfm.process_cond(z_q_st, target_len=mel.shape[1])
+            cond = self.cfm.process_cond(z_q_st)
             out["pred_mel"] = self.cfm.reverse_diffusion_train(
                 cond, mel_mask, n_timesteps=mel_recon_n_steps, cfg=0.0
             )

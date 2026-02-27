@@ -17,21 +17,22 @@ from dit_modules import (
     CausalConvPositionEmbedding,
     DiTBlock,
     AdaLayerNormZero_Final,
+    FlashAttn3Processor,
     RotaryEmbedding,
 )
 
 
 class InputEmbedding(nn.Module):
-    """Project noised mel x and condition cond to model dim."""
+    """Project noised mel x to model dim. Condition is fed via cross attention."""
 
-    def __init__(self, mel_dim, cond_dim, out_dim):
+    def __init__(self, mel_dim, out_dim):
         super().__init__()
-        self.proj = nn.Linear(mel_dim + cond_dim, out_dim)
+        self.proj = nn.Linear(mel_dim, out_dim)
         self.conv_pos_embed = CausalConvPositionEmbedding(dim=out_dim)
 
-    def forward(self, x, cond):
-        # x: (B, T, mel_dim), cond: (B, T, cond_dim)
-        x = self.proj(torch.cat([x, cond], dim=-1))
+    def forward(self, x):
+        # x: (B, T, mel_dim)
+        x = self.proj(x)
         x = self.conv_pos_embed(x) + x
         return x
 
@@ -65,37 +66,48 @@ class DiT(nn.Module):
         dropout=0.1,
         ff_mult=4,
         long_skip_connection=False,
+        use_flash_attn_3=False,
     ):
         super().__init__()
 
         self.time_embed = TimestepEmbedding(dim)
-        self.input_embed = InputEmbedding(mel_dim, cond_dim, dim)
+        self.input_embed = InputEmbedding(mel_dim, dim)
 
         self.rotary_embed = RotaryEmbedding(dim_head)
 
         self.dim = dim
         self.depth = depth
+        self.use_flash_attn_3 = use_flash_attn_3
 
-        self.transformer_blocks = nn.ModuleList(
-            [DiTBlock(dim=dim, heads=heads, dim_head=dim_head, ff_mult=ff_mult, dropout=dropout) for _ in range(depth)]
-        )
+        attn_processor = FlashAttn3Processor() if use_flash_attn_3 else None
+
+        self.transformer_blocks = nn.ModuleList([
+            DiTBlock(
+                dim=dim, heads=heads, dim_head=dim_head,
+                ff_mult=ff_mult, dropout=dropout,
+                attn_processor=attn_processor,
+                context_dim=cond_dim,
+            )
+            for _ in range(depth)
+        ])
         self.long_skip_connection = nn.Linear(dim * 2, dim, bias=False) if long_skip_connection else None
 
         self.norm_out = AdaLayerNormZero_Final(dim)
         self.proj_out = nn.Linear(dim, mel_dim)
 
-    def forward(self, x, t, cond, x_mask, return_dict=False):
+    def forward(self, x, t, cond, x_mask, cond_mask=None, return_dict=False):
         """Predict flow velocity.
 
         Args:
-            x: (B, T, mel_dim) noised mel
+            x: (B, T_mel, mel_dim) noised mel
             t: (B,) diffusion timestep in [0, 1]
-            cond: (B, T, cond_dim) condition embedding
-            x_mask: (B, T) mask, 1=valid, 0=padding
+            cond: (B, T_cond, cond_dim) condition embedding (can differ from T_mel)
+            x_mask: (B, T_mel) mask, 1=valid, 0=padding
+            cond_mask: (B, T_cond) mask for cond, 1=valid, 0=padding; defaults to all valid
             return_dict: if True, return dict with 'output' and 'hidden_states'
 
         Returns:
-            output: (B, T, mel_dim) predicted flow velocity
+            output: (B, T_mel, mel_dim) predicted flow velocity
             if return_dict: {"output": ..., "hidden_states": [...]}
         """
         batch, seq_len = x.shape[0], x.shape[1]
@@ -104,25 +116,27 @@ class DiT(nn.Module):
             t = t.unsqueeze(0).expand(batch)
 
         t_emb = self.time_embed(t)
-        x = self.input_embed(x, cond)
+        x = self.input_embed(x)
 
         rope = self.rotary_embed.forward_from_seq_len(seq_len)
 
-        # x_mask: 1=valid, 0=padding. Attention mask: True=attend, False=mask out.
-        # We need both query and key positions valid to attend.
         if x_mask is not None:
-            # (B, T) -> (B, 1, T, T): valid[b,q,k] = mask[b,q] & mask[b,k]
-            mask_bool = x_mask.bool()
-            attn_mask = mask_bool.unsqueeze(2) & mask_bool.unsqueeze(1)  # (B, T, T)
+            if self.use_flash_attn_3:
+                attn_mask = x_mask.bool()  # (B, T) – FA3 processor handles varlen packing
+            else:
+                mask_bool = x_mask.bool()
+                attn_mask = mask_bool.unsqueeze(2) & mask_bool.unsqueeze(1)  # (B, T, T)
         else:
             attn_mask = None
+
+        ctx_mask = cond_mask.bool() if cond_mask is not None else None  # True=valid for cross attn
 
         if self.long_skip_connection is not None:
             residual = x
 
         all_hidden = []
         for block in self.transformer_blocks:
-            x = block(x, t_emb, mask=attn_mask, rope=rope)
+            x = block(x, t_emb, mask=attn_mask, rope=rope, context=cond, context_mask=ctx_mask)
             if return_dict:
                 all_hidden.append(x.clone())
 

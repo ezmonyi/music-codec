@@ -240,8 +240,121 @@ class AttnProcessor:
         return x
 
 
+def _extract_padding_mask(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    """Extract (B, T) boolean padding mask from various mask formats."""
+    if mask is None:
+        return None
+    if mask.dim() == 2:
+        return mask.bool()
+    if mask.dim() == 3:
+        return mask[:, 0, :].bool()
+    if mask.dim() == 4:
+        return mask[:, 0, 0, :].bool()
+    return None
+
+
+class FlashAttn3Processor:
+    """Attention processor using Flash Attention 3 (Hopper GPU, sm90).
+
+    Requires ``flash-attn >= 2.7`` compiled with Hopper support.
+    Falls back to the standard FA interface when the Hopper-specific
+    ``flash_attn_interface`` module is not on the Python path.
+
+    Padding is handled via ``flash_attn_varlen_func`` (packed sequences) so
+    that padding tokens never participate in the softmax.
+    """
+
+    def __init__(self):
+        try:
+            from flash_attn_interface import (
+                flash_attn_func,
+                flash_attn_varlen_func,
+            )
+        except ImportError:
+            from flash_attn.flash_attn_interface import (
+                flash_attn_func,
+                flash_attn_varlen_func,
+            )
+        self._fa_func = flash_attn_func
+        self._fa_varlen_func = flash_attn_varlen_func
+
+    # --------------------------------------------------------------------- #
+
+    def __call__(
+        self,
+        attn: "Attention",
+        x: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+        rope=None,
+    ) -> torch.Tensor:
+        B, S = x.shape[:2]
+
+        q = attn.to_q(x)
+        k = attn.to_k(x)
+        v = attn.to_v(x)
+
+        if rope is not None:
+            freqs, xpos_scale = rope
+            q_scale = xpos_scale if isinstance(xpos_scale, (int, float)) else 1.0
+            k_scale = 1.0 / q_scale if q_scale != 1.0 else 1.0
+            q = apply_rotary_pos_emb(q, freqs, q_scale)
+            k = apply_rotary_pos_emb(k, freqs, k_scale)
+
+        head_dim = attn.inner_dim // attn.heads
+        q = q.view(B, S, attn.heads, head_dim)
+        k = k.view(B, S, attn.heads, head_dim)
+        v = v.view(B, S, attn.heads, head_dim)
+
+        padding_mask = _extract_padding_mask(mask)
+
+        if padding_mask is not None:
+            out = self._varlen_forward(q, k, v, padding_mask)
+        else:
+            out = self._fa_func(q, k, v, dropout_p=0.0, causal=False)
+            if isinstance(out, tuple):
+                out = out[0]
+
+        x = out.reshape(B, S, attn.inner_dim).to(q.dtype)
+        x = attn.to_out[0](x)
+        x = attn.to_out[1](x)
+
+        if padding_mask is not None:
+            x = x.masked_fill(~padding_mask.unsqueeze(-1), 0.0)
+
+        return x
+
+    # --------------------------------------------------------------------- #
+
+    def _varlen_forward(self, q, k, v, padding_mask):
+        """Run flash_attn_varlen_func on packed (unpadded) sequences."""
+        B, S, H, D = q.shape
+
+        seqlens = padding_mask.sum(-1, dtype=torch.int32)
+        cu_seqlens = F.pad(seqlens.cumsum(0, dtype=torch.int32), (1, 0))
+        max_seqlen = seqlens.max().item()
+
+        idx = padding_mask.nonzero(as_tuple=False)
+        q_pack = q[idx[:, 0], idx[:, 1]]
+        k_pack = k[idx[:, 0], idx[:, 1]]
+        v_pack = v[idx[:, 0], idx[:, 1]]
+
+        out = self._fa_varlen_func(
+            q_pack, k_pack, v_pack,
+            cu_seqlens, cu_seqlens,
+            max_seqlen, max_seqlen,
+            dropout_p=0.0,
+            causal=False,
+        )
+        if isinstance(out, tuple):
+            out = out[0]
+
+        result = q.new_zeros(B, S, H, D)
+        result[idx[:, 0], idx[:, 1]] = out
+        return result
+
+
 class Attention(nn.Module):
-    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0):
+    def __init__(self, dim, heads=8, dim_head=64, dropout=0.0, processor=None):
         super().__init__()
         self.dim = dim
         self.heads = heads
@@ -256,8 +369,61 @@ class Attention(nn.Module):
             nn.Dropout(dropout),
         ])
 
+        self.processor = processor or AttnProcessor()
+
     def forward(self, x, mask=None, rope=None):
-        return AttnProcessor()(self, x, mask=mask, rope=rope)
+        return self.processor(self, x, mask=mask, rope=rope)
+
+
+# ---------------------------------------------------------------------------
+# Cross Attention (query from x, key/value from context)
+# ---------------------------------------------------------------------------
+
+
+class CrossAttention(nn.Module):
+    """Cross attention: q from x, k/v from context. No RoPE on context."""
+
+    def __init__(self, dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        context_dim = context_dim or dim
+        self.heads = heads
+        self.inner_dim = dim_head * heads
+
+        self.to_q = nn.Linear(dim, self.inner_dim)
+        self.to_k = nn.Linear(context_dim, self.inner_dim)
+        self.to_v = nn.Linear(context_dim, self.inner_dim)
+        self.to_out = nn.ModuleList([
+            nn.Linear(self.inner_dim, dim),
+            nn.Dropout(dropout),
+        ])
+
+    def forward(self, x, context, key_padding_mask=None):
+        """x: (B, T_q, dim), context: (B, T_kv, context_dim), key_padding_mask: (B, T_kv) bool, True=valid."""
+        B, T_q, _ = x.shape
+        T_kv = context.shape[1]
+
+        q = self.to_q(x)  # (B, T_q, inner_dim)
+        k = self.to_k(context)  # (B, T_kv, inner_dim)
+        v = self.to_v(context)
+
+        head_dim = self.inner_dim // self.heads
+        q = q.view(B, T_q, self.heads, head_dim).transpose(1, 2)  # (B, H, T_q, D)
+        k = k.view(B, T_kv, self.heads, head_dim).transpose(1, 2)
+        v = v.view(B, T_kv, self.heads, head_dim).transpose(1, 2)
+
+        if key_padding_mask is not None:
+            # key_padding_mask: True=valid, False=pad. SDPA expects True=attend, False=mask out.
+            attn_mask = key_padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T_kv)
+            attn_mask = attn_mask.expand(B, self.heads, T_q, T_kv)
+        else:
+            attn_mask = None
+
+        x = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+        x = x.transpose(1, 2).reshape(B, T_q, self.inner_dim)
+
+        x = self.to_out[0](x)
+        x = self.to_out[1](x)
+        return x
 
 
 # ---------------------------------------------------------------------------
@@ -266,21 +432,31 @@ class Attention(nn.Module):
 
 
 class DiTBlock(nn.Module):
-    def __init__(self, dim, heads, dim_head, ff_mult=4, dropout=0.1):
+    def __init__(self, dim, heads, dim_head, ff_mult=4, dropout=0.1, attn_processor=None, context_dim=None):
         super().__init__()
 
         self.attn_norm = AdaLayerNormZero(dim)
-        self.attn = Attention(dim=dim, heads=heads, dim_head=dim_head, dropout=dropout)
+        self.attn = Attention(dim=dim, heads=heads, dim_head=dim_head, dropout=dropout, processor=attn_processor)
+
+        self.cross_attn = None
+        if context_dim is not None:
+            self.cross_attn_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+            self.cross_attn = CrossAttention(dim, context_dim=context_dim, heads=heads, dim_head=dim_head, dropout=dropout)
+            self.cross_attn_gate = nn.Parameter(torch.zeros(1))
 
         self.ff_norm = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.ff = FeedForward(dim=dim, mult=ff_mult, dropout=dropout, approximate="tanh")
 
-    def forward(self, x, t, mask=None, rope=None):
+    def forward(self, x, t, mask=None, rope=None, context=None, context_mask=None):
         norm, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.attn_norm(x, emb=t)
 
         attn_output = self.attn(x=norm, mask=mask, rope=rope)
-
         x = x + gate_msa.unsqueeze(1) * attn_output
+
+        if self.cross_attn is not None and context is not None:
+            cx = self.cross_attn_norm(x)
+            cx_out = self.cross_attn(cx, context, key_padding_mask=context_mask)
+            x = x + self.cross_attn_gate * cx_out
 
         ff_norm = self.ff_norm(x) * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
         ff_output = self.ff(ff_norm)

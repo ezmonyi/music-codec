@@ -22,8 +22,7 @@ class FlowMatchingTransformer(nn.Module):
     Condition flow:
         cond_code (B, T_cond, cond_dim)
         → cond_emb: Linear(cond_dim, hidden_size)
-        → resampling_layers: ConvTranspose1d (optional, e.g. 25Hz→50Hz)
-        → DiT: predict flow velocity
+        → DiT: cross attention to cond (no upsampling)
     """
 
     def __init__(
@@ -51,29 +50,7 @@ class FlowMatchingTransformer(nn.Module):
         # Condition embedding: cond_dim → hidden_size
         self.cond_emb = nn.Linear(cond_dim, hidden_size)
 
-        # Condition upsampling (e.g., 25Hz → 50Hz)
-        if cond_scale_factor != 1:
-            self.do_resampling = True
-            assert math.log2(cond_scale_factor).is_integer()
-            up_layers = []
-            for _ in range(int(math.log2(cond_scale_factor))):
-                up_layers.extend(
-                    [
-                        nn.ConvTranspose1d(
-                            hidden_size,
-                            hidden_size,
-                            kernel_size=4,
-                            stride=2,
-                            padding=1,
-                        ),
-                        nn.GELU(),
-                    ]
-                )
-            self.resampling_layers = nn.Sequential(*up_layers)
-        else:
-            self.do_resampling = False
-
-        # Flow velocity estimator (DiT backbone, CosyVoice-style)
+        # Flow velocity estimator (DiT with cross attention to cond)
         dim_head = hidden_size // num_heads
         self.diff_estimator = DiT(
             mel_dim=mel_dim,
@@ -123,35 +100,16 @@ class FlowMatchingTransformer(nn.Module):
     #  Condition processing
     # ------------------------------------------------------------------
 
-    def process_cond(self, cond_code, target_len=None):
-        """Embed condition and upsample to mel frame rate.
+    def process_cond(self, cond_code):
+        """Embed condition. No upsampling; cross attention handles different lengths.
 
         Args:
             cond_code: (B, T_cond, cond_dim) e.g. VQ embeddings at 25Hz
-            target_len: optional target time dim (mel frames) for alignment
 
         Returns:
-            cond: (B, T_mel, hidden_size)
+            cond: (B, T_cond, hidden_size)
         """
-        cond = self.cond_emb(cond_code)  # (B, T_cond, hidden_size)
-
-        if self.do_resampling:
-            # Transpose to (B, hidden_size, T_cond) for ConvTranspose1d
-            cond = cond.transpose(1, 2)  # (B, hidden_size, T_cond)
-            cond = self.resampling_layers(cond)  # (B, hidden_size, T_cond * scale_factor)
-            cond = cond.transpose(1, 2)  # (B, T_cond * scale_factor, hidden_size)
-
-        if target_len is not None:
-            if cond.shape[1] >= target_len:
-                cond = cond[:, :target_len, :]
-            else:
-                # Pad to target_len by repeating the last frame
-                padding_frames = target_len - cond.shape[1]
-                last_frame = cond[:, -1:, :]  # (B, 1, hidden_size)
-                padding = last_frame.repeat(1, padding_frames, 1)  # (B, padding_frames, hidden_size)
-                cond = torch.cat([cond, padding], dim=1)  # (B, target_len, hidden_size)
-
-        return cond
+        return self.cond_emb(cond_code)
 
     # ------------------------------------------------------------------
     #  Forward diffusion (noising)
@@ -203,24 +161,22 @@ class FlowMatchingTransformer(nn.Module):
     #  Training
     # ------------------------------------------------------------------
 
-    def loss_t(self, x, x_mask, t, cond):
+    def loss_t(self, x, x_mask, t, cond, cond_mask=None):
         """Compute flow matching loss at a given timestep.
 
         Args:
-            x:      (B, T, mel_dim) target mel
-            x_mask: (B, T) mask (1 = valid, 0 = padding)
-            t:      (B,) timestep
-            cond:   (B, T, hidden_size) processed condition
+            x:         (B, T_mel, mel_dim) target mel
+            x_mask:    (B, T_mel) mask (1 = valid, 0 = padding)
+            t:         (B,) timestep
+            cond:      (B, T_cond, hidden_size) processed condition
+            cond_mask: (B, T_cond) mask for cond, 1=valid; optional, defaults to all valid
 
         Returns:
             dict with "output": (noise, x, flow_pred, final_mask)
         """
-        # Ensure x and cond have matching time dimensions
-        assert x.shape[1] == cond.shape[1], \
-            f"Time dimension mismatch: x.shape={x.shape}, cond.shape={cond.shape}"
         assert x.shape[1] == x_mask.shape[1], \
             f"Time dimension mismatch: x.shape={x.shape}, x_mask.shape={x_mask.shape}"
-        
+
         xt, z = self.forward_diffusion(x, t)
 
         # CFG dropout: randomly zero out condition during training
@@ -228,13 +184,13 @@ class FlowMatchingTransformer(nn.Module):
             keep = (torch.rand(x.shape[0], device=x.device) > self.cfg_drop_prob).float()
             cond = cond * keep[:, None, None]
 
-        flow_pred = self.diff_estimator(xt, t, cond, x_mask)  # (B, T, mel_dim)
+        flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
-        final_mask = x_mask[..., None]  # (B, T, 1)
+        final_mask = x_mask[..., None]  # (B, T_mel, 1)
 
         return {"output": (z, x, flow_pred, final_mask)}
 
-    def compute_loss(self, x, x_mask, cond):
+    def compute_loss(self, x, x_mask, cond, cond_mask=None):
         """Sample timestep and compute flow matching loss."""
         t = torch.rand(x.shape[0], device=x.device, requires_grad=False)
         t = torch.clamp(t, 1e-5, 1.0)
@@ -242,36 +198,34 @@ class FlowMatchingTransformer(nn.Module):
         if self.time_scheduler == "cos":
             t = 1 - torch.cos(t * math.pi * 0.5)
 
-        return self.loss_t(x, x_mask, t, cond)
+        return self.loss_t(x, x_mask, t, cond, cond_mask=cond_mask)
 
-    def forward(self, x, x_mask, cond_code):
+    def forward(self, x, x_mask, cond_code, cond_mask=None):
         """Training forward: embed condition → compute loss.
 
         Args:
             x:         (B, T_mel, mel_dim) target mel spectrogram
             x_mask:    (B, T_mel) mask
             cond_code: (B, T_cond, cond_dim) raw condition (e.g. VQ embeddings)
+            cond_mask: (B, T_cond) mask for cond, 1=valid; optional
         """
-        T = x.shape[1]
-        cond = self.process_cond(cond_code, target_len=T)
-        # Ensure cond has the same time dimension as x
-        assert cond.shape[1] == x.shape[1], \
-            f"Time dimension mismatch after process_cond: x.shape={x.shape}, cond.shape={cond.shape}, target_len={T}"
-        return self.compute_loss(x, x_mask, cond)
+        cond = self.process_cond(cond_code)
+        return self.compute_loss(x, x_mask, cond, cond_mask=cond_mask)
 
     # ------------------------------------------------------------------
     #  Inference / training-time generation
     # ------------------------------------------------------------------
 
     def reverse_diffusion_train(
-        self, cond, x_mask=None, n_timesteps=32, cfg=0.0, rescale_cfg=0.75
+        self, cond, x_mask=None, cond_mask=None, n_timesteps=32, cfg=0.0, rescale_cfg=0.75
     ):
         """Generate mel via Euler ODE (keeps graph for gradients). Use for mel_recon / disc loss.
 
         Same as reverse_diffusion but without no_grad, so pred_mel has requires_grad.
         """
         h = 1.0 / n_timesteps
-        B, T, _ = cond.shape
+        B, T_cond, _ = cond.shape
+        T = int(round(T_cond * self.cond_scale_factor)) if x_mask is None else x_mask.shape[1]
 
         if x_mask is None:
             x_mask = torch.ones(B, T, device=cond.device, dtype=cond.dtype)
@@ -283,11 +237,11 @@ class FlowMatchingTransformer(nn.Module):
 
         for i in range(n_timesteps):
             t = (i + 0.5) * h * torch.ones(B, dtype=cond.dtype, device=cond.device)
-            flow_pred = self.diff_estimator(xt, t, cond, x_mask)
+            flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
             if cfg > 0:
                 uncond_flow_pred = self.diff_estimator(
-                    xt, t, torch.zeros_like(cond), x_mask
+                    xt, t, torch.zeros_like(cond), x_mask, cond_mask=cond_mask
                 )
                 pos_std = flow_pred.std()
                 flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
@@ -300,22 +254,24 @@ class FlowMatchingTransformer(nn.Module):
 
     @torch.no_grad()
     def reverse_diffusion(
-        self, cond, x_mask=None, n_timesteps=32, cfg=1.0, rescale_cfg=0.75
+        self, cond, x_mask=None, cond_mask=None, n_timesteps=32, cfg=1.0, rescale_cfg=0.75
     ):
         """Generate mel via Euler ODE from processed condition.
 
         Args:
-            cond:        (B, T, hidden_size) processed condition
-            x_mask:      (B, T) mask
+            cond:        (B, T_cond, hidden_size) processed condition
+            x_mask:      (B, T_mel) mask; if None, T_mel = T_cond * cond_scale_factor
+            cond_mask:   (B, T_cond) mask for cond; optional
             n_timesteps: Euler integration steps
             cfg:         classifier-free guidance scale (0 = no guidance)
             rescale_cfg: CFG rescaling weight
 
         Returns:
-            xt: (B, T, mel_dim) generated mel spectrogram
+            xt: (B, T_mel, mel_dim) generated mel spectrogram
         """
         h = 1.0 / n_timesteps
-        B, T, _ = cond.shape
+        B, T_cond, _ = cond.shape
+        T = int(round(T_cond * self.cond_scale_factor)) if x_mask is None else x_mask.shape[1]
 
         if x_mask is None:
             x_mask = torch.ones(B, T, device=cond.device)
@@ -327,12 +283,12 @@ class FlowMatchingTransformer(nn.Module):
 
         for i in range(n_timesteps):
             t = (i + 0.5) * h * torch.ones(B, dtype=cond.dtype, device=cond.device)
-            flow_pred = self.diff_estimator(xt, t, cond, x_mask)
+            flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
             # Classifier-free guidance
             if cfg > 0:
                 uncond_flow_pred = self.diff_estimator(
-                    xt, t, torch.zeros_like(cond), x_mask
+                    xt, t, torch.zeros_like(cond), x_mask, cond_mask=cond_mask
                 )
                 pos_std = flow_pred.std()
                 flow_pred_cfg = flow_pred + cfg * (flow_pred - uncond_flow_pred)
@@ -345,13 +301,14 @@ class FlowMatchingTransformer(nn.Module):
 
     @torch.no_grad()
     def generate(
-        self, cond_code, x_mask=None, n_timesteps=32, cfg=1.0, rescale_cfg=0.75
+        self, cond_code, x_mask=None, cond_mask=None, n_timesteps=32, cfg=1.0, rescale_cfg=0.75
     ):
         """Generate mel from raw condition code (convenience wrapper).
 
         Args:
             cond_code: (B, T_cond, cond_dim) raw condition (e.g. VQ embeddings at 25Hz)
-            x_mask:    (B, T_mel) mask for output mel
+            x_mask:    (B, T_mel) mask for output mel; if None, T_mel = T_cond * cond_scale_factor
+            cond_mask: (B, T_cond) mask for cond; optional
             n_timesteps: Euler steps
             cfg:       CFG scale
             rescale_cfg: CFG rescaling weight
@@ -359,10 +316,5 @@ class FlowMatchingTransformer(nn.Module):
         Returns:
             mel: (B, T_mel, mel_dim)
         """
-        cond = self.process_cond(cond_code)  # (B, T_mel, hidden_size)
-        T = cond.shape[1]
-
-        if x_mask is None:
-            x_mask = torch.ones(cond.shape[0], T, device=cond.device)
-
-        return self.reverse_diffusion(cond, x_mask, n_timesteps, cfg, rescale_cfg)
+        cond = self.process_cond(cond_code)  # (B, T_cond, hidden_size)
+        return self.reverse_diffusion(cond, x_mask, cond_mask, n_timesteps, cfg, rescale_cfg)

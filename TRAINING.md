@@ -20,7 +20,7 @@
 ./bin/train_music_codec.sh conf/single_vq.yaml
 ```
 
-端到端：特征 → resample → concat → in_proj → VQ → CFM → mel，损失为 flow_loss + commit_loss（+ codebook_loss）。
+端到端：特征 → resample → concat → in_proj → VQ → CFM（cond 经 cross attention 注入）→ mel，损失为 flow_loss + commit_loss（+ codebook_loss）。
 
 ### 2. FM-only 预训练 → Joint（消融）
 
@@ -73,6 +73,7 @@
 - `torch`（含 distributed）
 - `hyperpyyaml`、`PyYAML`、`tqdm`、`tensorboard`
 - WebDataset 时：`webdataset`
+- **Flash Attention 3（可选）**：DiT 支持 `use_flash_attn_3=True`，需安装 `flash-attn >= 2.7` 并在 Hopper GPU（H100/H800）上运行，可显著加速自注意力。若需启用，需在 `FlowMatchingTransformer` 与 `AudioReconModel` 中传入该参数（当前配置模板未包含，可自行添加）。
 
 安装示例：`pip install hyperpyyaml pyyaml tqdm tensorboard webdataset`
 
