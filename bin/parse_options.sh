@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Parse --option value and set shell variable option_name=value.
 # Source with: source bin/parse_options.sh
+#
+# Multi-node DDP options (must be defined in caller before sourcing):
+#   --num_nodes, --node_idx, --master_addr, --master_port, --rdzv_id,
+#   --gpus_per_node, --batch_size, --num_workers, etc.
 
 for ((argpos=1; argpos<$#; argpos++)); do
   if [ "${!argpos}" == "--config" ]; then

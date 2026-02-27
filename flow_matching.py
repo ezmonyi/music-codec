@@ -1,8 +1,8 @@
 """
-Conditional Flow Matching with DiffLlama backbone.
+Conditional Flow Matching with DiT backbone.
 
 Adapted from SoulX-Singer (Amphion) for audio codec reconstruction.
-Simplified: no prompt mechanism, no REPA/CTC auxiliary losses.
+Uses DiT (Diffusion Transformer) like CosyVoice, compatible with DiffLlama interface.
 """
 
 import os
@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llama import DiffLlama
+from dit import DiT
 
 
 class FlowMatchingTransformer(nn.Module):
@@ -23,7 +23,7 @@ class FlowMatchingTransformer(nn.Module):
         cond_code (B, T_cond, cond_dim)
         → cond_emb: Linear(cond_dim, hidden_size)
         → resampling_layers: ConvTranspose1d (optional, e.g. 25Hz→50Hz)
-        → DiffLlama: predict flow velocity
+        → DiT: predict flow velocity
     """
 
     def __init__(
@@ -73,15 +73,18 @@ class FlowMatchingTransformer(nn.Module):
         else:
             self.do_resampling = False
 
-        # Flow velocity estimator
-        self.diff_estimator = DiffLlama(
+        # Flow velocity estimator (DiT backbone, CosyVoice-style)
+        dim_head = hidden_size // num_heads
+        self.diff_estimator = DiT(
             mel_dim=mel_dim,
-            hidden_size=hidden_size,
-            num_heads=num_heads,
-            num_layers=num_layers,
+            cond_dim=hidden_size,
+            dim=hidden_size,
+            depth=num_layers,
+            heads=num_heads,
+            dim_head=dim_head,
+            dropout=0.1,
+            ff_mult=4,
         )
-        if gradient_checkpointing:
-            self.diff_estimator.gradient_checkpointing_enable()
 
         self.reset_parameters()
 

@@ -56,7 +56,7 @@ def get_args():
     )
     parser.add_argument("--model", default="model", help="model key in config (must match yaml)")
     parser.add_argument("--config", required=True, help="config yaml (hyperpyyaml)")
-    parser.add_argument("--local-rank", help="placeholder for DDP")
+    parser.add_argument("--local-rank", "--local_rank", help="placeholder for DDP (set by torchrun/launch)")
     parser.add_argument("--dataset_conf", required=True, help="dataset yaml or manifest path")
     parser.add_argument("--model_dir", required=True, help="save model dir")
     parser.add_argument("--tensorboard_dir", default="tensorboard", help="tensorboard log dir")

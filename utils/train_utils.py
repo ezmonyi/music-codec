@@ -274,23 +274,6 @@ def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
         m.train()
 
 
-def _mel_to_waveform_batch(mel_batch, sample_rate=24000, n_fft=1920, hop_length=480, n_mels=128):
-    """(B, T, F) mel -> (B, 1, T_wav) waveform. Uses Griffin-Lim per item."""
-    from dataset.mel_to_features import mel_to_waveform
-    B = mel_batch.shape[0]
-    wavs = []
-    for b in range(B):
-        wav = mel_to_waveform(
-            mel_batch[b],
-            sample_rate=sample_rate,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-        )
-        wavs.append(wav)
-    return torch.cat(wavs, dim=0)
-
-
 def batch_forward(model, batch, info_dict):
     """Codec: move batch to device, run model, compute flow_loss + commit_loss; optional mel_recon and disc.
     If batch has only mel and mel_mask (GPU extraction path), run feature extractor on GPU first."""
