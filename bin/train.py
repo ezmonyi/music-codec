@@ -9,8 +9,6 @@ model in LightningModule and adapting save/load; DDP keeps the pipeline aligned
 with your existing cosyvoice scripts.
 """
 
-from __future__ import print_function
-
 import os
 import sys
 import argparse
@@ -147,27 +145,21 @@ def main():
         )
 
     restore_model_path = configs.get("train_conf", {}).get("restore_model_path")
-    restore_load_encoder = configs.get("train_conf", {}).get("restore_load_encoder", True)
     if restore_model_path and os.path.isfile(restore_model_path):
         ckpt = torch.load(restore_model_path, map_location="cpu")
-        if restore_load_encoder:
-            model.load_state_dict(ckpt, strict=True)
-            print("Restore model from {} (full model including encoder)".format(restore_model_path))
-        else:
-            # Load only codebook (skip conv1d/MLP - keep random init)
-            model_state = model.state_dict()
-            loaded_keys = []
-            skipped_keys = []
-            for k, v in ckpt.items():
-                if k in model_state and k == "vq_codebook.weight":
-                    model_state[k] = v
-                    loaded_keys.append(k)
-                elif k.startswith("whisper_resample") or k.startswith("wavlm_resample") or k.startswith("in_proj"):
-                    skipped_keys.append(k)
-            model.load_state_dict(model_state, strict=False)
-            print("Restore model from {} (codebook only, encoder kept random)".format(restore_model_path))
-            if skipped_keys:
-                print("  Skipped encoder layers: {}".format(", ".join(skipped_keys[:5]) + ("..." if len(skipped_keys) > 5 else "")))
+        model_state = model.state_dict()
+        loaded_keys = []
+        for k, v in ckpt.items():
+            if k not in model_state:
+                continue
+            # Load only VQ codebook(s): single VQ or RVQ layers
+            if k == "vq_codebook.weight" or k.startswith("rvq.codebooks.") and k.endswith(".weight"):
+                model_state[k] = v
+                loaded_keys.append(k)
+        model.load_state_dict(model_state, strict=False)
+        print("Restore VQ codebook from {} (encoder kept random init)".format(restore_model_path))
+        if loaded_keys:
+            print("  Loaded: {}".format(", ".join(loaded_keys[:8]) + ("..." if len(loaded_keys) > 8 else "")))
 
     model = wrap_cuda_model(args, model)
 
@@ -196,12 +188,6 @@ def main():
     info_dict = deepcopy(configs["train_conf"])
     info_dict["step"] = last_step
     info_dict["epoch"] = last_epoch
-
-    # Always use GPU-side feature extraction (whisper/wavlm/muq from audio or mel)
-    from dataset.mel_to_features import CodecFeatureExtractor
-    info_dict["feature_extractor"] = CodecFeatureExtractor()
-    if rank == 0:
-        logging.info(f"[Rank {rank}] GPU feature extractor created on cuda:{rank}")
 
     save_model_opt(model, optimizer, "init", info_dict)
 

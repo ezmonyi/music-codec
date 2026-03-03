@@ -16,7 +16,7 @@ from utils.train_utils import (
     batch_forward,
     batch_backward,
     save_model_opt,
-    cosyvoice_join,
+    sync_ddp_ranks_or_break_epoch,
     get_scheduled_vq_weights,
     compute_eval_mel_recon_loss,
 )
@@ -27,7 +27,8 @@ class Executor:
         self.step = 0
         self.epoch = 0
         self.rank = int(__import__("os").environ.get("RANK", 0))
-        self.device = torch.device("cuda:{}".format(self.rank))
+        local_rank = int(__import__("os").environ.get("LOCAL_RANK", 0))
+        self.device = torch.device("cuda:{}".format(local_rank))
 
     def train_one_epoc(
         self,
@@ -93,8 +94,8 @@ class Executor:
                     info_dict["epoch"] = self.epoch
                     info_dict["batch_idx"] = batch_idx
                     info_dict.update(get_scheduled_vq_weights(self.step, info_dict))
-                    if cosyvoice_join(group_join, info_dict):
-                        logging.warning("cosyvoice_join break this epoch")
+                    if sync_ddp_ranks_or_break_epoch(group_join, info_dict):
+                        logging.warning("Uneven DDP workload detected, breaking epoch early")
                         break
 
                     if (
@@ -106,8 +107,10 @@ class Executor:
                         context = nullcontext
 
                     with context():
-                        info_dict = batch_forward(model, batch_dict, info_dict)
-                        info_dict = batch_backward(model, info_dict)
+                        fwd_result = batch_forward(model, batch_dict, info_dict)
+                        if fwd_result is None:
+                            continue  # skip corrupt batch (e.g. empty from bad tar)
+                        info_dict = batch_backward(model, fwd_result)
 
                     if self.rank == 0:
                         _s = lambda v: v.item() if torch.is_tensor(v) else v
@@ -202,8 +205,10 @@ class Executor:
                 info_dict["batch_idx"] = batch_idx
                 info_dict.update(get_scheduled_vq_weights(self.step, info_dict))
                 num_utts = batch_dict["mel"].shape[0]
-                total_num += num_utts
                 info_dict = batch_forward(model, batch_dict, info_dict)
+                if info_dict is None:
+                    continue
+                total_num += num_utts
                 for k, v in info_dict["loss_dict"].items():
                     if k not in total_loss_dict:
                         total_loss_dict[k] = []

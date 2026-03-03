@@ -3,8 +3,11 @@
 
 import argparse
 import glob
+import io
 import json
 import tarfile
+
+import numpy as np
 
 
 def main():
@@ -12,8 +15,8 @@ def main():
     parser.add_argument(
         "path",
         nargs="?",
-        default="/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w/shard_48*.tar",
-        help="Glob path to tar shards (e.g. .../shard_48*.tar)",
+        default="/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w_with_features/shard_*.tar",
+        help="Glob path to tar shards (e.g. .../shard_*.tar)",
     )
     parser.add_argument("-n", "--max-samples", type=int, default=3, help="Max samples to show detail (default 3)")
     parser.add_argument("--max-shards", type=int, default=2, help="Max shards to open (default 2)")
@@ -48,6 +51,7 @@ def main():
                         current_key = key
                         current_files = []
                     json_content = None
+                    npy_shape = None
                     if ext == "json":
                         try:
                             f = tar.extractfile(m)
@@ -55,7 +59,23 @@ def main():
                                 json_content = f.read().decode("utf-8")
                         except Exception:
                             pass
-                    current_files.append((name, m.size, ext, json_content))
+                    elif ext == "npy":
+                        try:
+                            f = tar.extractfile(m)
+                            if f:
+                                arr = np.load(io.BytesIO(f.read()))
+                                npy_shape = arr.shape
+                        except Exception:
+                            pass
+                    elif ext == "npz":
+                        try:
+                            f = tar.extractfile(m)
+                            if f:
+                                data = np.load(io.BytesIO(f.read()))
+                                npy_shape = {k: data[k].shape for k in data.files}
+                        except Exception:
+                            pass
+                    current_files.append((name, m.size, ext, json_content, npy_shape))
 
                 if current_files:
                     if sample_count < args.max_samples:
@@ -75,7 +95,9 @@ def _print_sample(files, sample_count):
     for item in sorted(files, key=lambda x: x[0]):
         name, size, ext = item[0], item[1], item[2]
         json_content = item[3] if len(item) > 3 else None
-        print(f"    {name}  ({size} bytes, .{ext})")
+        npy_shape = item[4] if len(item) > 4 else None
+        shape_str = f", shape={npy_shape}" if npy_shape is not None else ""
+        print(f"    {name}  ({size} bytes, .{ext}{shape_str})")
         if json_content is not None:
             try:
                 obj = json.loads(json_content)

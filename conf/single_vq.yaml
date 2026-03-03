@@ -14,7 +14,7 @@ dataset_conf:
 model: !new:model.AudioReconModel
   whisper_dim: 1280
   wavlm_dim: 1024
-  muq_dim: 1024
+  muq_dim: 2048
   codebook_size: 8192
   codebook_dim: 256
   in_proj_hidden_dims: [1024, 512]
@@ -40,8 +40,6 @@ train_conf:
 
   # Checkpoint restore
   restore_model_path: null
-  restore_load_encoder: false
-
   optim: adamw
   optim_conf:
     lr: 5.0e-4
@@ -82,20 +80,3 @@ train_conf:
   # Mel reconstruction
   mel_recon_weight: 0.0
   mel_recon_n_steps: 4
-
-  # Discriminator
-  use_disc: false
-  disc_weight: 1.0
-  disc_lr: 1.0e-4
-  disc_filters: 32
-  disc_n_ffts: [1024, 2048, 512]
-  disc_hop_lengths: [256, 512, 128]
-  disc_win_lengths: [1024, 2048, 512]
-
-  # Grad balancer
-  balancer_weights:
-    mel_recon: 1.0
-    disc_gen: 1.0
-  balancer_rescale_grads: true
-  balancer_total_norm: 1.0
-  balancer_ema_decay: 0.999

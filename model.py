@@ -8,7 +8,7 @@ Architecture (see config.yaml for hyperparameters):
     MuQ    feat (B,  750, 1024) @ 25Hz ──┘
                                           │
                                     concat dim=-1
-                                   (B, 750, 3328)
+                                   (B, 750, 4352)
                                           │
                                     in_proj (Linear or MLP)
                                    (B, 750, 256)
@@ -168,7 +168,7 @@ class AudioReconModel(nn.Module):
         # Feature dimensions
         whisper_dim=1280,
         wavlm_dim=1024,
-        muq_dim=1024,
+        muq_dim=2048,
         # VQ: single-layer
         codebook_size=8192,
         codebook_dim=256,
@@ -197,15 +197,17 @@ class AudioReconModel(nn.Module):
         codebook_init: str = "normal",
         vq_pre_batch_norm: bool = False,
         cfm_gradient_checkpointing: bool = False,
+        fm_only: bool = False,
     ):
         super().__init__()
 
+        self.fm_only = fm_only
         self.use_rvq = use_rvq
         self.use_codebook_ema = use_codebook_ema
         self.ema_decay = ema_decay
         self.mel_dim = mel_dim
         self.entropy_loss_weight = entropy_loss_weight
-        concat_dim = whisper_dim + wavlm_dim + muq_dim  # 3328
+        concat_dim = whisper_dim + wavlm_dim + muq_dim  # 4352
 
         if use_rvq:
             rvq_sizes = list(rvq_codebook_sizes) if rvq_codebook_sizes else [1024] * 8
@@ -402,12 +404,14 @@ class AudioReconModel(nn.Module):
         w = w[:, :min_len, :]
         wl = wl[:, :min_len, :]
         m = m[:, :min_len, :]
-        concat_feat = torch.cat([w, wl, m], dim=-1)  # (B, T, 3328)
+        concat_feat = torch.cat([w, wl, m], dim=-1)  # (B, T, 4352)
         z_e = self.in_proj(concat_feat)
         if self.pre_vq_bn is not None:
             # BatchNorm1d expects (N, C, L); z_e is (B, T, D) -> (B, D, T)
             z_e = self.pre_vq_bn(z_e.transpose(1, 2)).transpose(1, 2)
 
+        if self.fm_only:
+            return z_e, None, None, None
         if self.use_rvq:
             z_q_concat, codes, commitment_loss, codebook_loss, entropy_loss = self.rvq(z_e)
             z_q_st = self.cond_proj(z_q_concat)  # (B, T, cfm_cond_dim)
@@ -470,7 +474,10 @@ class AudioReconModel(nn.Module):
             "cfm_output": cfm_results["output"],
             "codes": codes,
         }
-        if self.use_rvq:
+        if self.fm_only:
+            out["commit_loss"] = mel.new_zeros(1).squeeze()
+            out["entropy_loss"] = mel.new_zeros(1).squeeze()
+        elif self.use_rvq:
             out["commit_loss"] = vq_losses[0]
             out["codebook_loss"] = vq_losses[1]
             out["entropy_loss"] = vq_losses[2]
@@ -509,7 +516,10 @@ class AudioReconModel(nn.Module):
             z_q = self.cond_proj(z_q)  # (B, T, cfm_cond_dim)
         else:
             z_q = self.vq_codebook(codes)
-        return self.cfm.generate(z_q, mel_mask, n_timesteps, cfg, rescale_cfg)
+        return self.cfm.generate(
+            z_q, x_mask=mel_mask, n_timesteps=n_timesteps,
+            cfg=cfg, rescale_cfg=rescale_cfg,
+        )
 
     @torch.no_grad()
     def decode_from_features(
@@ -529,7 +539,10 @@ class AudioReconModel(nn.Module):
             codes: (B, T) VQ codes
         """
         z_q_st, codes, *_ = self.encode(whisper_feat, wavlm_feat, muq_feat)
-        mel = self.cfm.generate(z_q_st, mel_mask, n_timesteps, cfg, rescale_cfg)
+        mel = self.cfm.generate(
+            z_q_st, x_mask=mel_mask, n_timesteps=n_timesteps,
+            cfg=cfg, rescale_cfg=rescale_cfg,
+        )
         return mel, codes
 
 

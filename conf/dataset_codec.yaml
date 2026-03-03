@@ -1,21 +1,13 @@
-# Dataset config for codec training.
-# Option A - WebDataset (tar shards): set urls to a glob pattern, e.g. .../shard_48*.tar
-# Option B - JSONL manifest: set manifest_path to a JSONL with whisper_path, wavlm_path, muq_path, mel_path per line.
+# Dataset config for codec training (WebDataset with pre-extracted features).
 #
-# Tar structure: each sample has mel.npz and optionally an audio field (e.g. flac, wav).
-# Prefer use_audio_for_features: true when the tar packs audio: features are extracted from the
-# waveform field directly (no mel→inverse mel→waveform). When use_audio_for_features: false and
-# use_mel_extractor: true, only mel.npz is loaded and whisper/wavlm/muq are computed from mel→wav.
-# feature_extraction_on_gpu: when true with use_mel_extractor (and no use_audio_for_features), extraction runs on GPU in training.
+# Tar structure per sample:
+#   {id}.json                -- metadata
+#   {id}.mel.npz             -- precomputed mel spectrogram
+#   {id}.whisper_feature.npy -- pre-extracted Whisper feature (T, 1280)
+#   {id}.wavlm_feature.npy  -- pre-extracted WavLM feature  (T, 1024)
+#   {id}.muq_feature.npy    -- pre-extracted MuQ feature    (T, 1024)
 
-urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w/shard_48*.tar"
-
-# Extract features from webdataset audio field (flac/wav) instead of from mel→wav. Set to false if tar has no audio field.
-use_audio_for_features: true
-feature_extraction_on_gpu: true
-
-feature_keys:
-  mel: "mel.npz"
+urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w_with_features/shard_64*.tar"
 
 max_frames_50hz: 1500
 seed: 42

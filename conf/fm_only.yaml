@@ -1,10 +1,9 @@
-# FM-only training: bypass VQ, send encoder features directly to CFM.
-# Same model architecture as single_vq.yaml for checkpoint compatibility.
-# Exported checkpoints (encoder_cfm_*.pt) have encoder+CFM trained, VQ random.
+# FM-only training: bypass VQ entirely. Pre-VQ features (z_e from in_proj) go
+# directly as condition to the flow matching reconstruction model.
+# VQ layers exist but are never used in forward; only in_proj + CFM are trained.
 #
 # Usage:
-#   ./bin/run_fm_only.sh conf/fm_only.yaml
-#   # then set restore_model_path in single_vq.yaml to encoder_cfm_*.pt
+#   ./bin/train_music_codec.sh conf/fm_only.yaml
 
 __set_seed1: !apply:random.seed [42]
 __set_seed2: !apply:numpy.random.seed [42]
@@ -16,11 +15,12 @@ dataset_conf:
   max_frames_50hz: 1500
   seed: 42
 
-# Model: identical to single_vq.yaml (VQ codebook is present but frozen/bypassed)
+# Model: fm_only=True bypasses VQ, sends pre-VQ features directly to CFM
 model: !new:model.AudioReconModel
+  fm_only: true
   whisper_dim: 1280
   wavlm_dim: 1024
-  muq_dim: 1024
+  muq_dim: 2048
   codebook_size: 8192
   codebook_dim: 256
   in_proj_hidden_dims: [1024, 512]
@@ -43,7 +43,7 @@ model: !new:model.AudioReconModel
 
 train_conf:
   dtype: fp32
-  batch_size: 6               # lower than joint; use 4 if still OOM with gradient_checkpointing
+  batch_size: 16              # lower than joint; use 4 if still OOM with gradient_checkpointing
   restore_model_path: null
   optim: adamw
   optim_conf:

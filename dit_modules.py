@@ -217,6 +217,8 @@ class AttnProcessor:
         if mask is not None:
             if mask.dim() == 2:
                 attn_mask = mask.unsqueeze(1).unsqueeze(1)
+            elif mask.dim() == 3:
+                attn_mask = mask.unsqueeze(1)  # (B, Q, K) -> (B, 1, Q, K) for expand
             else:
                 attn_mask = mask
             attn_mask = attn_mask.expand(batch_size, attn.heads, query.shape[-2], key.shape[-2])

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
+from torch.utils.checkpoint import checkpoint as torch_checkpoint
 
 from dit_modules import (
     TimestepEmbedding,
@@ -67,6 +68,7 @@ class DiT(nn.Module):
         ff_mult=4,
         long_skip_connection=False,
         use_flash_attn_3=False,
+        gradient_checkpointing=False,
     ):
         super().__init__()
 
@@ -78,6 +80,7 @@ class DiT(nn.Module):
         self.dim = dim
         self.depth = depth
         self.use_flash_attn_3 = use_flash_attn_3
+        self.gradient_checkpointing = gradient_checkpointing
 
         attn_processor = FlashAttn3Processor() if use_flash_attn_3 else None
 
@@ -136,7 +139,13 @@ class DiT(nn.Module):
 
         all_hidden = []
         for block in self.transformer_blocks:
-            x = block(x, t_emb, mask=attn_mask, rope=rope, context=cond, context_mask=ctx_mask)
+            if self.gradient_checkpointing and self.training:
+                x = torch_checkpoint(
+                    block, x, t_emb, attn_mask, rope, cond, ctx_mask,
+                    use_reentrant=False,
+                )
+            else:
+                x = block(x, t_emb, mask=attn_mask, rope=rope, context=cond, context_mask=ctx_mask)
             if return_dict:
                 all_hidden.append(x.clone())
 

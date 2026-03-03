@@ -151,14 +151,9 @@ def save_model_opt(model, optimizer, name, info_dict):
     info_dict_copy = dict(info_dict)
     # Remove non-serializable objects before YAML dump
     info_dict_copy.pop("feature_extractor", None)
-    info_dict_copy.pop("discriminator", None)
-    info_dict_copy.pop("D_optimizer", None)
-    info_dict_copy.pop("balancer", None)
     info_dict_copy.pop("loss_dict", None)
     info_dict_copy.pop("_pred_mel", None)
     info_dict_copy.pop("_mel_recon_loss", None)
-    info_dict_copy.pop("_D_loss", None)
-    info_dict_copy.pop("_disc_gen_loss", None)
     info_dict_copy.pop("codes_for_hist", None)
     info_dict_copy["save_time"] = datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")
     import yaml
@@ -194,8 +189,8 @@ def find_last_state(model_dir):
     return last_model_path, last_opt_path, last_step, last_epoch
 
 
-def cosyvoice_join(group_join, info_dict):
-    """Barrier for uneven DDP; return True to break epoch."""
+def sync_ddp_ranks_or_break_epoch(group_join, info_dict):
+    """Barrier to sync DDP ranks each batch; return True to break epoch if uneven workload detected."""
     if info_dict["batch_idx"] != 0:
         try:
             local_rank = int(os.environ.get("LOCAL_RANK", 0))
@@ -233,8 +228,10 @@ def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
         wf_l, wlf_l, mf_l = [], [], []
         with torch.no_grad():
             for i in range(audio.shape[0]):
+                # T_mel from audio duration (50Hz) to align feature length; mel is GT only
+                T_mel = int(audio.shape[1] / sr * 50)
                 w, wl, m_ = extractor.extract_from_waveform(
-                    audio[i], sr, T_mel=mel.shape[1]
+                    audio[i], sr, T_mel=T_mel
                 )
                 wf_l.append(w)
                 wlf_l.append(wl)
@@ -243,14 +240,12 @@ def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
         wavlm_feat = torch.stack(wlf_l).to(dtype)
         muq_feat = torch.stack(mf_l).to(dtype)
     elif "whisper_feat" not in batch_dict:
-        extractor = info_dict.get("feature_extractor")
-        if extractor is None:
-            return None
-        with torch.no_grad():
-            whisper_feat, wavlm_feat, muq_feat = extractor.extract_batch(mel)
-        whisper_feat = whisper_feat.to(dtype)
-        wavlm_feat = wavlm_feat.to(dtype)
-        muq_feat = muq_feat.to(dtype)
+        # Mel is GT only; cannot use mel for feature extraction. Need pre-computed features.
+        logging.debug(
+            "compute_eval_mel_recon_loss: skipping eval (no audio, no features; "
+            "mel cannot be used for feature extraction)"
+        )
+        return None
     else:
         whisper_feat = batch_dict["whisper_feat"].to(device, dtype=dtype)
         wavlm_feat = batch_dict["wavlm_feat"].to(device, dtype=dtype)
@@ -275,8 +270,9 @@ def compute_eval_mel_recon_loss(model, batch_dict, info_dict, n_steps=8):
 
 
 def batch_forward(model, batch, info_dict):
-    """Codec: move batch to device, run model, compute flow_loss + commit_loss; optional mel_recon and disc.
-    If batch has only mel and mel_mask (GPU extraction path), run feature extractor on GPU first."""
+    """Codec: move batch to device, run model, compute flow_loss + commit_loss; optional mel_recon.
+    Mel is used ONLY as ground truth for flow matching reconstruction.
+    Batch must have pre-computed features (whisper_feat/wavlm_feat/muq_feat) or audio."""
     device = torch.device("cuda:{}".format(int(os.environ.get("LOCAL_RANK", 0))))
     dtype = info_dict.get("dtype", "fp32")
     if dtype == "fp16":
@@ -289,30 +285,53 @@ def batch_forward(model, batch, info_dict):
     mel = batch["mel"].to(device, dtype=dtype)
     mel_mask = batch["mel_mask"].to(device)
 
-    extractor = info_dict.get("feature_extractor")
-    if extractor is None:
-        raise RuntimeError(
-            "Batch has audio but info_dict has no feature_extractor "
-            "(set feature_extractor config in dataset_conf)"
-        )
-    audio = batch["audio"].to(device)
-    sr = batch["sample_rate"][0].item()
-    wf_l, wlf_l, mf_l = [], [], []
-    with torch.no_grad():
-        for i in range(audio.shape[0]):
-            w, wl, m_ = extractor.extract_from_waveform(
-                audio[i], sr, T_mel=mel.shape[1]
+    if "whisper_feat" in batch:
+        whisper_feat = batch["whisper_feat"].to(device, dtype=dtype)
+        wavlm_feat = batch["wavlm_feat"].to(device, dtype=dtype)
+        muq_feat = batch["muq_feat"].to(device, dtype=dtype)
+        # Fix malformed shape from webdataset packing: (B, 1, T, D) -> (B, T, D)
+        def _squeeze_to_3d(x):
+            if x.dim() == 4:
+                if x.numel() == 0:
+                    return None  # corrupt batch, skip
+                x = x.reshape(x.shape[0], x.shape[2], x.shape[3])
+            return x
+        whisper_feat = _squeeze_to_3d(whisper_feat)
+        wavlm_feat = _squeeze_to_3d(wavlm_feat)
+        muq_feat = _squeeze_to_3d(muq_feat)
+        if whisper_feat is None or wavlm_feat is None or muq_feat is None:
+            return None  # corrupt batch
+    elif "audio" in batch:
+        extractor = info_dict.get("feature_extractor")
+        if extractor is None:
+            raise RuntimeError(
+                "Batch has audio but info_dict has no feature_extractor "
+                "(set feature_extractor config in dataset_conf)"
             )
-            wf_l.append(w)
-            wlf_l.append(wl)
-            mf_l.append(m_)
-    whisper_feat = torch.stack(wf_l).to(dtype)
-    wavlm_feat = torch.stack(wlf_l).to(dtype)
-    muq_feat = torch.stack(mf_l).to(dtype)
+        audio = batch["audio"].to(device)
+        sr = batch["sample_rate"][0].item()
+        wf_l, wlf_l, mf_l = [], [], []
+        with torch.no_grad():
+            for i in range(audio.shape[0]):
+                # T_mel from audio duration (50Hz); mel is GT only
+                T_mel = int(audio.shape[1] / sr * 50)
+                w, wl, m_ = extractor.extract_from_waveform(
+                    audio[i], sr, T_mel=T_mel
+                )
+                wf_l.append(w)
+                wlf_l.append(wl)
+                mf_l.append(m_)
+        whisper_feat = torch.stack(wf_l).to(dtype)
+        wavlm_feat = torch.stack(wlf_l).to(dtype)
+        muq_feat = torch.stack(mf_l).to(dtype)
+    else:
+        raise RuntimeError(
+            "Batch must contain either pre-computed features "
+            "(whisper_feat/wavlm_feat/muq_feat) or audio"
+        )
     mel_recon_weight = info_dict.get("mel_recon_weight", 0.0)
-    use_disc = info_dict.get("use_disc", False)
     mel_recon_n_steps = info_dict.get("mel_recon_n_steps", 4)
-    need_pred_mel = mel_recon_weight > 0 or use_disc
+    need_pred_mel = mel_recon_weight > 0
 
     with torch.amp.autocast(enabled=(dtype != torch.float32), device_type="cuda", dtype=dtype):
         out = model(
@@ -334,9 +353,9 @@ def batch_forward(model, batch, info_dict):
         codebook_weight = info_dict.get("codebook_loss_weight", 1.0)
         loss = loss + codebook_weight * codebook_loss
     entropy_loss = out.get("entropy_loss")
-    if entropy_loss is not None:
-        # Get entropy_loss_weight from info_dict (config) or model
-        m = model.module if hasattr(model, "module") else model
+    m = model.module if hasattr(model, "module") else model
+    fm_only = getattr(m, "fm_only", False)
+    if entropy_loss is not None and not fm_only:
         entropy_loss_weight = info_dict.get("entropy_loss_weight", getattr(m, "entropy_loss_weight", 0.0))
         if entropy_loss_weight > 0:
             loss = loss + entropy_loss_weight * entropy_loss
@@ -351,38 +370,33 @@ def batch_forward(model, batch, info_dict):
         info_dict["_pred_mel"] = pred_mel
         info_dict["_mel_recon_loss"] = mel_recon_loss
 
-    # Codebook utilization
-    codes = out["codes"]
-    m = model.module if hasattr(model, "module") else model
-    if codes.dim() == 3 and getattr(m, "use_rvq", False):
-        codebook_sizes = m.rvq.codebook_sizes
-        utils = []
-        for i in range(codes.shape[-1]):
-            num_used = codes[..., i].unique().numel()
-            utils.append(num_used / float(codebook_sizes[i]))
-        codebook_util = sum(utils) / len(utils)
-    else:
-        codebook_size = m.codebook_size
-        num_used = codes.unique().numel()
-        codebook_util = num_used / float(codebook_size)
-    info_dict["codes_for_hist"] = codes.detach().flatten()
-
+    # Codebook utilization (skip when fm_only: no VQ, pre-VQ features go directly to CFM)
     loss_dict = {
         "total_loss": loss,
         "flow_matching_loss": flow_loss,
         "commit_loss": commit_loss,
-        "codebook_util": torch.tensor(codebook_util, device=loss.device, dtype=torch.float32),
     }
+    if not fm_only and out["codes"] is not None:
+        codes = out["codes"]
+        if codes.dim() == 3 and getattr(m, "use_rvq", False):
+            codebook_sizes = m.rvq.codebook_sizes
+            utils = []
+            for i in range(codes.shape[-1]):
+                num_used = codes[..., i].unique().numel()
+                utils.append(num_used / float(codebook_sizes[i]))
+            codebook_util = sum(utils) / len(utils)
+        else:
+            codebook_size = m.codebook_size
+            num_used = codes.unique().numel()
+            codebook_util = num_used / float(codebook_size)
+        loss_dict["codebook_util"] = torch.tensor(codebook_util, device=loss.device, dtype=torch.float32)
+        info_dict["codes_for_hist"] = codes.detach().flatten()
     if codebook_loss is not None:
         loss_dict["codebook_loss"] = codebook_loss
     if entropy_loss is not None:
         loss_dict["entropy_loss"] = entropy_loss
     if mel_recon_loss is not None:
         loss_dict["mel_recon_loss"] = mel_recon_loss
-    if disc_gen_loss is not None:
-        loss_dict["disc_gen_loss"] = disc_gen_loss
-    if D_loss is not None:
-        loss_dict["disc_D_loss"] = D_loss  # discriminator loss (for TensorBoard / shell)
     info_dict["loss_dict"] = loss_dict
     return info_dict
 
@@ -392,34 +406,9 @@ def batch_backward(model, info_dict):
         raise NotImplementedError
     loss_dict = info_dict["loss_dict"]
     accum_grad = info_dict["accum_grad"]
-    balancer = info_dict.get("balancer")
-    pred_mel = info_dict.get("_pred_mel")
-    discriminator = info_dict.get("discriminator")
-
-    if balancer is not None and pred_mel is not None:
-        loss_main = info_dict.get("flow_loss_weight", 0.1) * loss_dict["flow_matching_loss"] + info_dict.get("commit_loss_weight", 0.25) * loss_dict["commit_loss"]
-        if "codebook_loss" in loss_dict:
-            loss_main = loss_main + info_dict.get("codebook_loss_weight", 1.0) * loss_dict["codebook_loss"]
-        if "entropy_loss" in loss_dict:
-            m = model.module if hasattr(model, "module") else model
-            entropy_loss_weight = info_dict.get("entropy_loss_weight", getattr(m, "entropy_loss_weight", 0.0))
-            if entropy_loss_weight > 0:
-                loss_main = loss_main + entropy_loss_weight * loss_dict["entropy_loss"]
-        scaled_main = loss_main / accum_grad
-        scaled_main.backward(retain_graph=True)
-        bal_losses = {}
-        if "_mel_recon_loss" in info_dict and info_dict.get("mel_recon_weight", 0) > 0:
-            bal_losses["mel_recon"] = info_dict["_mel_recon_loss"]
-        if "_disc_gen_loss" in info_dict:
-            bal_losses["disc_gen"] = info_dict["_disc_gen_loss"]
-        if bal_losses:
-            balancer.backward(bal_losses, pred_mel)
-        if discriminator is not None and "_D_loss" in info_dict:
-            info_dict["_D_loss"].backward()
-    else:
-        scaled_loss = loss_dict["total_loss"] / accum_grad
-        scaled_loss.backward()
-        loss_dict["total_loss"] = scaled_loss
+    scaled_loss = loss_dict["total_loss"] / accum_grad
+    scaled_loss.backward()
+    loss_dict["total_loss"] = scaled_loss
     return info_dict
 
 
@@ -430,10 +419,6 @@ def update_parameter_and_lr(model, optimizer, scheduler, info_dict):
         if torch.isfinite(grad_norm):
             optimizer.step()
         optimizer.zero_grad()
-        D_optimizer = info_dict.get("D_optimizer")
-        if D_optimizer is not None:
-            D_optimizer.step()
-            D_optimizer.zero_grad()
         scheduler.step()
     info_dict["lr"] = optimizer.param_groups[0]["lr"]
     info_dict["grad_norm"] = grad_norm

@@ -15,11 +15,11 @@ flowchart TD
         WL --> WLR["Conv1d stride=2\n50Hz to 25Hz"]
         M --> MID["Identity"]
         
-        WR -->|"(B,750,1280)"| CAT["Concat dim=-1\n(B, 750, 3328)"]
+        WR -->|"(B,750,1280)"| CAT["Concat dim=-1\n(B, 750, 4352)"]
         WLR -->|"(B,750,1024)"| CAT
         MID -->|"(B,750,1024)"| CAT
 
-        CAT --> INPROJ["in_proj MLP\n3328 to 256 (or Linear if no hidden_dims)"]
+        CAT --> INPROJ["in_proj MLP\n4352 to 256 (or Linear if no hidden_dims)"]
         INPROJ --> VQ["VQ codebook lookup\ncodebook_size=8192\nstraight-through"]
         VQ -->|"codes (B,750)"| CODES["Discrete Tokens\nfor LM target"]
         VQ -->|"z_q_st (B,750,256)"| CFM
@@ -38,7 +38,7 @@ flowchart TD
 
 ## 关键设计决策
 
-- **先 Concat 再 VQ / RVQ**: 3 路特征各自 resample 到 25Hz 后，在特征维度 concat 成 (B, 750, 3328)，经 `in_proj` 压缩到 256 维（单层 VQ）或 `rvq_hidden_dim`（RVQ）。`in_proj` 可为单层 Linear 或多层 MLP：当配置 `in_proj_hidden_dims` 非空时（如 [1024, 512]）为 concat_dim → … → codebook_dim / rvq_hidden_dim 的 MLP（GELU + 可选 dropout），未配置时退化为单层 Linear。每帧单层 VQ 产生一个 token；RVQ 产生 n_layers 个 token（时间对齐后 concat 再 cond_proj 进 CFM）。
+- **先 Concat 再 VQ / RVQ**: 3 路特征各自 resample 到 25Hz 后，在特征维度 concat 成 (B, 750, 4352)，经 `in_proj` 压缩到 256 维（单层 VQ）或 `rvq_hidden_dim`（RVQ）。`in_proj` 可为单层 Linear 或多层 MLP：当配置 `in_proj_hidden_dims` 非空时（如 [1024, 512]）为 concat_dim → … → codebook_dim / rvq_hidden_dim 的 MLP（GELU + 可选 dropout），未配置时退化为单层 Linear。每帧单层 VQ 产生一个 token；RVQ 产生 n_layers 个 token（时间对齐后 concat 再 cond_proj 进 CFM）。
 - **单层 VQ → CFM**: 256 维 codebook embedding（straight-through）直接作为 CFM 的 `cond_code`。**RVQ**：各层 16 维量化向量按时间对齐 concat 成 (B, T, n*16)，经 `cond_proj` 映射到 256 维再进 CFM，CFM 内部仍为 `cond_emb = nn.Linear(256, 1024)`。
 - **Cross Attention 条件注入**：condition 不再上采样到 mel 帧率，而是保持 (B, T_cond, hidden_size)。DiT 在每个 block 内通过 Cross Attention 让 mel 序列（Q）attend 到 cond（K/V），T_cond 与 T_mel 可不同。推理时 `T_mel = T_cond * cond_scale_factor`。
 - **VQ / RVQ 端到端训练**: 重建梯度通过 CFM → straight-through → in_proj 反传。单层 VQ 仅 commitment loss；RVQ 与 SoundStream / mucodec 对齐：**commitment loss**（encoder 拉向 codebook）+ **codebook loss**（codebook 拉向 encoder），可选 **L2 归一化** lookup（Improved VQGAN），权重通常为 0.25 * commitment + 1.0 * codebook。
@@ -56,7 +56,7 @@ flowchart TD
 
 ```
 whisper_feat (B,1500,1280) ──Conv1d s=2──┐
-wavlm_feat  (B,1500,1024) ──Conv1d s=2──┤── concat ──→ (B,750,3328)
+wavlm_feat  (B,1500,1024) ──Conv1d s=2──┤── concat ──→ (B,750,4352)
 muq_feat    (B, 750,1024) ──identity────┘       │
                                           in_proj MLP / Linear
                                          (B, 750, 256)

@@ -61,6 +61,7 @@ class FlowMatchingTransformer(nn.Module):
             dim_head=dim_head,
             dropout=0.1,
             ff_mult=4,
+            gradient_checkpointing=gradient_checkpointing,
         )
 
         self.reset_parameters()

@@ -1,8 +1,8 @@
 model:
-  # Feature dimensions (concat = 1280 + 1024 + 1024 = 3328)
+  # Feature dimensions (concat = 1280 + 1024 + 2048 = 4352)
   whisper_dim: 1280        # Whisper-large-v3 encoder output
   wavlm_dim: 1024          # WavLM-Large last hidden state
-  muq_dim: 1024            # MuQ-large last hidden state
+  muq_dim: 2048            # MuQ-large (extra layer concat) last hidden state
 
   # Native frame rates (before resampling)
   whisper_frame_rate: 50   # 16kHz / 320 hop
@@ -21,7 +21,7 @@ model:
   # rvq_codebook_dim: 16
   # cfm_cond_dim: 256      # condition dim fed to CFM (RVQ concat 8*16=128 → cond_proj 128→256)
 
-  # in_proj: concat (3328) → codebook_dim (single) or rvq_hidden_dim (RVQ). None or [] = single Linear; else MLP
+  # in_proj: concat (4352) → codebook_dim (single) or rvq_hidden_dim (RVQ). None or [] = single Linear; else MLP
   in_proj_hidden_dims: [1024, 512]
   in_proj_dropout: 0.1
 

@@ -49,10 +49,10 @@ master_addr="${master_addr:-127.0.0.1}"
 master_port="${master_port:-29500}"
 rdzv_id="${rdzv_id:-}"  # Unique job id for multi-node rendezvous (auto-set if empty)
 
-# Data / training
+# Data / training (conservative defaults to avoid pod OOM; override if you have more RAM)
 batch_size="${batch_size:-4}"
-num_workers="${num_workers:-8}"
-prefetch="${prefetch:-4}"
+num_workers="${num_workers:-2}"
+prefetch="${prefetch:-2}"
 timeout="${timeout:-300}"
 pin_memory="${pin_memory:-true}"
 

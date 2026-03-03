@@ -14,7 +14,7 @@ dataset_conf:
 model: !new:model.AudioReconModel
   whisper_dim: 1280
   wavlm_dim: 1024
-  muq_dim: 1024
+  muq_dim: 2048
   use_rvq: true
   rvq_codebook_sizes: [4096, 2048, 1024, 512, 512, 512, 512]
   rvq_hidden_dim: 256
