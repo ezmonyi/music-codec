@@ -1,0 +1,7 @@
+# Core training (bin/train.sh, bin/train.py)
+torch
+hyperpyyaml
+pyyaml
+tqdm
+tensorboard
+webdataset

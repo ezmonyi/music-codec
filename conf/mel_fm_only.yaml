@@ -1,0 +1,81 @@
+# FM-only training (Stage 1): bypass VQ entirely, but mirror Stage 2 architecture.
+# Path: concat(4352) → in_proj(4352→1024→512→64) → post_vq_proj(64→512→1024) → DiT
+# Same 64d bottleneck as joint VQ training, so all weights transfer to Stage 2.
+#
+# Usage (standard for ablations; checkpoints/tensorboard per exp_name):
+#   ./bin/train.sh conf/mel_fm_only.yaml ablation_dit   --estimator dit
+#   ./bin/train.sh conf/mel_fm_only.yaml ablation_llama  --estimator llama
+
+__set_seed1: !apply:random.seed [42]
+__set_seed2: !apply:numpy.random.seed [42]
+__set_seed3: !apply:torch.manual_seed [42]
+__set_seed4: !apply:torch.cuda.manual_seed_all [42]
+
+estimator_type: "dit"
+
+dataset_conf:
+  urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w_with_features/shard_64*.tar"
+  max_frames_50hz: 1500
+  seed: 42
+  cv_ratio: 0.05              # use last 5% of shards as CV for MCD eval
+  # cv_num_shards: 2           # alternative: fixed number of CV shards
+  # cv_batch_size: 16          # default = train batch_size
+
+# Model: fm_only=True bypasses VQ, sends pre-VQ features directly to CFM
+model: !new:model.AudioReconModel
+  fm_only: true
+  whisper_dim: 1280
+  wavlm_dim: 1024
+  muq_dim: 2048
+  codebook_size: 32768
+  codebook_dim: 64
+  cfm_cond_dim: 1024
+  in_proj_hidden_dims: [1024, 512]
+  in_proj_dropout: 0.1
+  post_vq_proj_dims: [512, 1024]
+  mel_dim: 128
+  hidden_size: 1024
+  num_layers: 22
+  num_heads: 16
+  cfg_drop_prob: 0.2
+  sigma: 1.0e-6
+  time_scheduler: cos
+  cond_scale_factor: 1
+  use_codebook_ema: false
+  ema_decay: 0.99
+  entropy_loss_weight: 0.0
+  codebook_init_std: 0.02
+  codebook_init: "normal"
+  vq_pre_batch_norm: false
+  cfm_gradient_checkpointing: true   # reduce OOM (trades compute for memory)
+  estimator_type: !ref <estimator_type>
+
+stat:
+  melspec_2048_mean: 3.721995597732078
+  melspec_2048_std: 20.105172628224334
+
+train_conf:
+  dtype: fp32
+  batch_size: 32              # stage 1: effective batch 32 per GPU; adjust if OOM/too slow
+  restore_model_path: null
+  optim: adamw
+  optim_conf:
+    lr: 1.0e-5
+  scheduler: warmuplr
+  scheduler_conf:
+    warmup_steps: 2500
+    last_epoch: -1
+  max_epoch: 200
+  grad_clip: 5.0
+  accum_grad: 2
+  log_interval: 50
+  save_per_step: 2000
+  sigma: 1.0e-6              # flow matching sigma (matches model)
+  flow_loss_weight: 1.0      # no scaling in FM-only; total_loss == flow_matching_loss
+
+  # Eval: every N steps run one batch (no grad), generate mel and log L1 recon loss
+  eval_mel_recon_every_steps: 100
+  eval_mel_recon_n_steps: 8  # ODE steps for eval generation (fewer = faster)
+  # Eval: every N steps run MCD on a subset of CV set (decode mel, compute mean MCD and log)
+  eval_mcd_every_steps: 1000
+  eval_mcd_max_samples: 100   # cap CV samples for MCD (faster eval)

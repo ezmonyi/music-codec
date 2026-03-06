@@ -7,9 +7,10 @@ __set_seed3: !apply:torch.manual_seed [42]
 __set_seed4: !apply:torch.cuda.manual_seed_all [42]
 
 dataset_conf:
-  manifest_path: ""
-  max_frames_50hz: 1500
+  urls: "/mnt/fcl-jfs/music_tokenizer/webdataset_data/processed_webdataset_1000w_with_features/shard_64*.tar"
+  max_frames_50hz: 1500   # OOM? try 1000 or 750 (shorter seq = less memory)
   seed: 42
+  cv_ratio: 0.05
 
 model: !new:model.AudioReconModel
   whisper_dim: 1280
@@ -33,6 +34,11 @@ model: !new:model.AudioReconModel
   codebook_init_std: 0.02
   codebook_init: "normal"
   vq_pre_batch_norm: false
+  cfm_gradient_checkpointing: true   # OOM: trades compute for memory (DiT activations)
+
+stat:
+  melspec_2048_mean: 3.721995597732078
+  melspec_2048_std: 20.105172628224334
 
 train_conf:
   dtype: fp32

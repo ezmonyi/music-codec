@@ -198,6 +198,8 @@ class AudioReconModel(nn.Module):
         vq_pre_batch_norm: bool = False,
         cfm_gradient_checkpointing: bool = False,
         fm_only: bool = False,
+        post_vq_proj_dims: Optional[Sequence[int]] = None,
+        estimator_type: str = "dit",
     ):
         super().__init__()
 
@@ -271,6 +273,23 @@ class AudioReconModel(nn.Module):
             self.rvq = None
             self.cond_proj = None
 
+        # ── Post-VQ projection: codebook_dim → cfm_cond_dim (when dims differ) ──────────────────────
+        if post_vq_proj_dims:
+            layers = []
+            dims = [codebook_dim] + list(post_vq_proj_dims)
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(nn.GELU())
+            self.post_vq_proj = nn.Sequential(*layers)
+            for m in self.post_vq_proj.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.normal_(m.weight, mean=0.0, std=0.02)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        else:
+            self.post_vq_proj = None
+
         # ── CFM decoder (always receives cfm_cond_dim) ──────────────────────────────────────────────
         self.cfm = FlowMatchingTransformer(
             mel_dim=mel_dim,
@@ -283,6 +302,7 @@ class AudioReconModel(nn.Module):
             sigma=sigma,
             time_scheduler=time_scheduler,
             gradient_checkpointing=cfm_gradient_checkpointing,
+            estimator_type=estimator_type,
         )
 
     @staticmethod
@@ -411,13 +431,16 @@ class AudioReconModel(nn.Module):
             z_e = self.pre_vq_bn(z_e.transpose(1, 2)).transpose(1, 2)
 
         if self.fm_only:
-            return z_e, None, None, None
+            z_out = self.post_vq_proj(z_e) if self.post_vq_proj is not None else z_e
+            return z_out, None, None, None
         if self.use_rvq:
             z_q_concat, codes, commitment_loss, codebook_loss, entropy_loss = self.rvq(z_e)
             z_q_st = self.cond_proj(z_q_concat)  # (B, T, cfm_cond_dim)
             return z_q_st, codes, commitment_loss, codebook_loss, entropy_loss
         else:
             z_q_st, codes, commit_loss, entropy_loss = self._vq_quantize(z_e)
+            if self.post_vq_proj is not None:
+                z_q_st = self.post_vq_proj(z_q_st)
             return z_q_st, codes, commit_loss, entropy_loss
 
     def get_pre_vq_features(self, whisper_feat, wavlm_feat, muq_feat):
@@ -516,6 +539,8 @@ class AudioReconModel(nn.Module):
             z_q = self.cond_proj(z_q)  # (B, T, cfm_cond_dim)
         else:
             z_q = self.vq_codebook(codes)
+            if self.post_vq_proj is not None:
+                z_q = self.post_vq_proj(z_q)
         return self.cfm.generate(
             z_q, x_mask=mel_mask, n_timesteps=n_timesteps,
             cfg=cfg, rescale_cfg=rescale_cfg,

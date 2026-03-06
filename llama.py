@@ -127,8 +127,10 @@ class DiffLlama(LlamaModel):
         num_heads=16,
         num_layers=16,
         config=LlamaConfig(0, 256, 1024, 1, 1),
+        gradient_checkpointing=False,
     ):
         super().__init__(config)
+        self.gradient_checkpointing = gradient_checkpointing
 
         self.layers = nn.ModuleList(
             [

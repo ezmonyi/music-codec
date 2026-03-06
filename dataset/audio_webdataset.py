@@ -6,6 +6,10 @@ Design: mel is used ONLY as ground truth for flow matching reconstruction.
 Features (whisper/wavlm/muq) are conditioning; mel is never used to drive
 feature extraction or alignment.
 
+When target_type="earvae_latent", reads waveform from OSS (audio_filepath),
+caches full-song waveform, chunks by segment time, resamples to 48kHz stereo.
+EAR_VAE encoding happens in batch_forward on GPU.
+
 Tar sample structure:
     {id}.json                -- metadata: audio_filepath, audio_basename,
                                 segment_index, segment_start_time, segment_end_time,
@@ -26,6 +30,7 @@ from io import BytesIO
 import numpy as np
 import torch
 import torch.distributed as dist
+import torchaudio
 from torch.utils.data import IterableDataset
 
 logger = logging.getLogger(__name__)
@@ -34,6 +39,28 @@ try:
     import webdataset as wds
 except ImportError:
     wds = None
+
+# OSS and EAR_VAE waveform logic only when target_type=earvae_latent
+def _read_waveform_from_oss(file_path: str, oss_pool) -> tuple:
+    """Read audio from OSS s3 path, return (audio [C, T], sample_rate) or None."""
+    try:
+        oss = oss_pool.get_conn()
+        bucket = file_path[5:].split("/", 1)[0]
+        name = file_path[5:].split("/", 1)[1]
+        audio_bytes = oss.get_file(bucket, name).read()
+        oss_pool.release_conn(oss)
+    except Exception as e:
+        logger.warning(f"[AudioWebDataset] OSS read failed {file_path}: {e}")
+        return None
+    try:
+        buf = BytesIO(audio_bytes)
+        ext = file_path.rsplit(".", 1)[-1].lower() if "." in file_path else ""
+        fmt = "mp4" if ext in ("m4a", "mp4") else None
+        audio, sr = torchaudio.load(buf, format=fmt)
+        return audio, sr
+    except Exception as e:
+        logger.warning(f"[AudioWebDataset] torchaudio load failed {file_path}: {e}")
+        return None
 
 
 def _decode_npz_mel(data):
@@ -80,11 +107,22 @@ class AudioWebDataset(IterableDataset):
     """Iterable dataset over tar shards with JSON metadata, mel.npz,
     and pre-extracted whisper/wavlm/muq features.
 
-    Each sample yields::
+    target_type:
+        "mel": yield mel + mel_mask + features (default).
+        "earvae_latent": read waveform from OSS, cache per song, chunk by segment,
+            resample to 48kHz stereo; yield waveform_48k + waveform_mask + features.
+            EAR_VAE encode happens in batch_forward on GPU.
+
+    Each sample yields (mel mode)::
 
         {"mel": (T, 128), "mel_mask": (T,),
          "whisper_feat": (T_w, 1280), "wavlm_feat": (T_wl, 1024),
          "muq_feat": (T_m, 1024)}
+
+    Or (earvae_latent mode)::
+
+        {"waveform_48k": (2, T_audio), "waveform_mask": (T_audio,),
+         "whisper_feat", "wavlm_feat", "muq_feat"}
     """
 
     def __init__(
@@ -93,6 +131,9 @@ class AudioWebDataset(IterableDataset):
         max_frames_50hz: int = 1500,
         seed: int = 42,
         handler=None,
+        target_type: str = "mel",
+        target_sr: int = 48000,
+        oss_pool=None,
     ):
         if wds is None:
             raise ImportError("webdataset is required; pip install webdataset")
@@ -100,6 +141,20 @@ class AudioWebDataset(IterableDataset):
         self.max_frames_50hz = max_frames_50hz
         self.rng = random.Random(seed)
         self.handler = handler or wds.handlers.warn_and_continue
+        self.target_type = target_type
+        self.target_sr = target_sr
+        self._waveform_cache = {}
+
+        if target_type == "earvae_latent":
+            if oss_pool is None:
+                try:
+                    from oss_cli import OSS_POOL
+                    oss_pool = OSS_POOL
+                except ImportError as e:
+                    raise ImportError(
+                        "earvae_latent requires oss_cli; pip install or set oss_pool"
+                    ) from e
+            self._oss_pool = oss_pool
 
         if isinstance(urls, str):
             if "*" in urls:
@@ -124,8 +179,47 @@ class AudioWebDataset(IterableDataset):
         if self.rank == 0:
             logger.info(
                 f"[AudioWebDataset] {len(self.urls)} shards, "
-                f"world_size={self.world_size}"
+                f"world_size={self.world_size}, target_type={target_type}"
             )
+
+    def _read_waveform_segment(self, metadata: dict):
+        """Read waveform from OSS, cache full song, chunk by segment, resample to target_sr stereo."""
+        audio_filepath = metadata.get("audio_filepath")
+        if not audio_filepath or not str(audio_filepath).startswith("s3://"):
+            return None
+        start_sample = int(metadata.get("segment_start_time", 0))
+        end_sample = int(metadata.get("segment_end_time", 0))
+        orig_sr = int(metadata.get("sample_rate", 24000))
+
+        # Cache: when path changes, clear and load new song
+        if self._waveform_cache.get("path") != audio_filepath:
+            result = _read_waveform_from_oss(audio_filepath, self._oss_pool)
+            if result is None:
+                return None
+            full_audio, full_sr = result
+            self._waveform_cache = {"path": audio_filepath, "audio": full_audio, "sr": full_sr}
+
+        full_audio = self._waveform_cache["audio"]
+        full_sr = self._waveform_cache["sr"]
+
+        # Chunk: segment indices at original sr
+        start_idx = int(start_sample * full_sr / orig_sr)
+        end_idx = int(end_sample * full_sr / orig_sr)
+        if start_idx >= full_audio.shape[1] or end_idx <= 0:
+            return None
+        start_idx = max(0, start_idx)
+        end_idx = min(full_audio.shape[1], end_idx)
+        segment = full_audio[:, start_idx:end_idx]
+
+        # Resample to target_sr
+        if full_sr != self.target_sr:
+            segment = torchaudio.functional.resample(segment, full_sr, self.target_sr)
+
+        # Mono -> stereo
+        if segment.shape[0] == 1:
+            segment = torch.cat([segment, segment], dim=0)
+
+        return segment
 
     def _decode_sample(self, sample):
         json_data = None
@@ -154,21 +248,13 @@ class AudioWebDataset(IterableDataset):
 
         if isinstance(json_data, bytes):
             json_data = json_data.decode("utf-8")
-        if isinstance(json_data, str):
-            try:
-                json.loads(json_data)
-            except json.JSONDecodeError as e:
-                logger.warning(f"[AudioWebDataset] bad JSON: {e}")
-                return None
-
-        # --- decode mel ---
-        mel = _decode_npz_mel(mel_data)
-        if mel is None:
-            logger.warning("[AudioWebDataset] failed to decode mel")
+        try:
+            meta = json.loads(json_data) if isinstance(json_data, str) else json_data
+        except json.JSONDecodeError as e:
+            logger.warning(f"[AudioWebDataset] bad JSON: {e}")
             return None
-        mel = _normalize_mel_shape(mel)
 
-        # --- decode pre-extracted features ---
+        # --- decode pre-extracted features (required for both modes) ---
         whisper_feat = _decode_npy_feature(whisper_data)
         wavlm_feat = _decode_npy_feature(wavlm_data)
         muq_feat = _decode_npy_feature(muq_data)
@@ -176,7 +262,32 @@ class AudioWebDataset(IterableDataset):
             logger.warning("[AudioWebDataset] missing one or more feature files")
             return None
 
-        # --- length limit: truncate mel from start (mel is GT only; features used as-is) ---
+        if self.target_type == "earvae_latent":
+            waveform_48k = self._read_waveform_segment(meta)
+            if waveform_48k is None:
+                return None
+            T = waveform_48k.shape[1]
+            if self.max_frames_50hz > 0:
+                max_samples = int(self.max_frames_50hz * 960)  # 50Hz * downsample 960
+                if T > max_samples:
+                    waveform_48k = waveform_48k[:, :max_samples]
+                    T = max_samples
+            waveform_mask = torch.ones(T, dtype=torch.float32)
+            return {
+                "waveform_48k": waveform_48k,
+                "waveform_mask": waveform_mask,
+                "whisper_feat": whisper_feat,
+                "wavlm_feat": wavlm_feat,
+                "muq_feat": muq_feat,
+            }
+
+        # --- mel mode: decode mel ---
+        mel = _decode_npz_mel(mel_data)
+        if mel is None:
+            logger.warning("[AudioWebDataset] failed to decode mel")
+            return None
+        mel = _normalize_mel_shape(mel)
+
         if self.max_frames_50hz > 0 and mel.shape[0] > self.max_frames_50hz:
             mel = mel[: self.max_frames_50hz]
 
@@ -217,13 +328,22 @@ class AudioWebDataset(IterableDataset):
             if out is not None:
                 sample_count += 1
                 if sample_count == 1 and worker_id == 0 and self.rank == 0:
-                    logger.info(
-                        f"[AudioWebDataset] First sample: "
-                        f"mel={out['mel'].shape}, "
-                        f"whisper={out['whisper_feat'].shape}, "
-                        f"wavlm={out['wavlm_feat'].shape}, "
-                        f"muq={out['muq_feat'].shape}"
-                    )
+                    if "mel" in out:
+                        logger.info(
+                            f"[AudioWebDataset] First sample: "
+                            f"mel={out['mel'].shape}, "
+                            f"whisper={out['whisper_feat'].shape}, "
+                            f"wavlm={out['wavlm_feat'].shape}, "
+                            f"muq={out['muq_feat'].shape}"
+                        )
+                    else:
+                        logger.info(
+                            f"[AudioWebDataset] First sample: "
+                            f"waveform_48k={out['waveform_48k'].shape}, "
+                            f"whisper={out['whisper_feat'].shape}, "
+                            f"wavlm={out['wavlm_feat'].shape}, "
+                            f"muq={out['muq_feat'].shape}"
+                        )
                 yield out
 
     def __len__(self):
@@ -231,41 +351,19 @@ class AudioWebDataset(IterableDataset):
 
 
 class AudioCollateFn:
-    """Pad mel and features to max length in batch, stack into tensors."""
+    """Pad mel/waveform and features to max length in batch, stack into tensors."""
 
-    def __init__(self, pad_value: float = 0.0):
+    def __init__(self, pad_value: float = 0.0, target_type: str = "mel"):
         self.pad_value = pad_value
+        self.target_type = target_type
 
     def __call__(self, batch_list):
-        mel_list = [b["mel"] for b in batch_list]
-        mask_list = [b["mel_mask"] for b in batch_list]
         whisper_list = [b["whisper_feat"] for b in batch_list]
         wavlm_list = [b["wavlm_feat"] for b in batch_list]
         muq_list = [b["muq_feat"] for b in batch_list]
 
         def _time_dim(x):
             return x.shape[1] if x.dim() == 3 and x.shape[0] == 1 else x.shape[0]
-
-        max_mel_t = max(x.shape[0] for x in mel_list)
-        max_whisper_t = max(_time_dim(x) for x in whisper_list)
-        max_wavlm_t = max(_time_dim(x) for x in wavlm_list)
-        max_muq_t = max(_time_dim(x) for x in muq_list)
-
-        def _pad_2d(x, max_t, pad_val=0.0):
-            if x.dim() != 2:
-                raise ValueError(f"_pad_2d expects 2D (T, D), got {x.shape}")
-            if x.shape[0] < max_t:
-                pad = torch.full(
-                    (max_t - x.shape[0], x.shape[1]), pad_val, dtype=x.dtype,
-                )
-                return torch.cat([x, pad], dim=0)
-            return x[:max_t]
-
-        def _pad_1d(x, max_t):
-            if x.shape[0] < max_t:
-                pad = torch.zeros(max_t - x.shape[0], dtype=x.dtype)
-                return torch.cat([x, pad], dim=0)
-            return x[:max_t]
 
         def _pad_feat(x, max_t, pad_val=0.0):
             """(T, D) or (1, T, D) -> pad time dim -> (1, max_t, D) for concat."""
@@ -278,19 +376,62 @@ class AudioCollateFn:
                 x = x[:max_t]
             return x.unsqueeze(0)
 
-        mel = torch.stack([_pad_2d(x, max_mel_t, self.pad_value) for x in mel_list])
-        mel_mask = torch.stack([_pad_1d(x, max_mel_t) for x in mask_list])
+        max_whisper_t = max(_time_dim(x) for x in whisper_list)
+        max_wavlm_t = max(_time_dim(x) for x in wavlm_list)
+        max_muq_t = max(_time_dim(x) for x in muq_list)
+
         whisper_feat = torch.cat([_pad_feat(x, max_whisper_t) for x in whisper_list], dim=0)
         wavlm_feat = torch.cat([_pad_feat(x, max_wavlm_t) for x in wavlm_list], dim=0)
         muq_feat = torch.cat([_pad_feat(x, max_muq_t) for x in muq_list], dim=0)
 
-        return {
-            "mel": mel,
-            "mel_mask": mel_mask,
-            "whisper_feat": whisper_feat,
-            "wavlm_feat": wavlm_feat,
-            "muq_feat": muq_feat,
-        }
+        out = {"whisper_feat": whisper_feat, "wavlm_feat": wavlm_feat, "muq_feat": muq_feat}
+
+        if "waveform_48k" in batch_list[0]:
+            # earvae_latent mode: pad waveform (2, T) to max T
+            wf_list = [b["waveform_48k"] for b in batch_list]
+            mask_list = [b["waveform_mask"] for b in batch_list]
+            max_t = max(w.shape[1] for w in wf_list)
+
+            def _pad_wf(w, max_t_):
+                if w.shape[1] < max_t_:
+                    pad = torch.zeros(2, max_t_ - w.shape[1], dtype=w.dtype)
+                    return torch.cat([w, pad], dim=1)
+                return w[:, :max_t_]
+
+            def _pad_1d(x, max_t_):
+                if x.shape[0] < max_t_:
+                    pad = torch.zeros(max_t_ - x.shape[0], dtype=x.dtype)
+                    return torch.cat([x, pad], dim=0)
+                return x[:max_t_]
+
+            out["waveform_48k"] = torch.stack([_pad_wf(w, max_t) for w in wf_list])
+            out["waveform_mask"] = torch.stack([_pad_1d(m, max_t) for m in mask_list])
+        else:
+            # mel mode
+            mel_list = [b["mel"] for b in batch_list]
+            mask_list = [b["mel_mask"] for b in batch_list]
+            max_mel_t = max(x.shape[0] for x in mel_list)
+
+            def _pad_2d(x, max_t, pad_val=0.0):
+                if x.dim() != 2:
+                    raise ValueError(f"_pad_2d expects 2D (T, D), got {x.shape}")
+                if x.shape[0] < max_t:
+                    pad = torch.full(
+                        (max_t - x.shape[0], x.shape[1]), pad_val, dtype=x.dtype,
+                    )
+                    return torch.cat([x, pad], dim=0)
+                return x[:max_t]
+
+            def _pad_1d(x, max_t):
+                if x.shape[0] < max_t:
+                    pad = torch.zeros(max_t - x.shape[0], dtype=x.dtype)
+                    return torch.cat([x, pad], dim=0)
+                return x[:max_t]
+
+            out["mel"] = torch.stack([_pad_2d(x, max_mel_t, self.pad_value) for x in mel_list])
+            out["mel_mask"] = torch.stack([_pad_1d(x, max_mel_t) for x in mask_list])
+
+        return out
 
 
 def init_dataset_and_dataloader(args, configs):
@@ -355,13 +496,18 @@ def init_dataset_and_dataloader(args, configs):
         train_urls = all_urls
         cv_urls = []
 
+    target_type = dataset_conf.get("target_type", "mel")
+    target_sr = dataset_conf.get("target_sr", 48000)
+
     train_dataset = AudioWebDataset(
         urls=train_urls,
         max_frames_50hz=max_frames,
         seed=seed,
+        target_type=target_type,
+        target_sr=target_sr,
     )
     num_workers_val = getattr(args, "num_workers", 4)
-    audio_collate_fn = AudioCollateFn(pad_value=0.0)
+    audio_collate_fn = AudioCollateFn(pad_value=0.0, target_type=target_type)
     logging.info(
         f"[DataLoader] AudioWebDataset: batch_size={batch_size}, "
         f"num_workers={num_workers_val}"
@@ -384,12 +530,14 @@ def init_dataset_and_dataloader(args, configs):
             urls=cv_urls,
             max_frames_50hz=max_frames,
             seed=seed + 1,
+            target_type=target_type,
+            target_sr=target_sr,
         )
         val_loader = torch.utils.data.DataLoader(
             val_dataset,
             batch_size=cv_batch_size,
             num_workers=num_workers_val,
-            collate_fn=AudioCollateFn(pad_value=0.0),
+            collate_fn=AudioCollateFn(pad_value=0.0, target_type=target_type),
             pin_memory=getattr(args, "pin_memory", False),
             prefetch_factor=getattr(args, "prefetch", 2) if num_workers_val > 0 else None,
             drop_last=False,

@@ -1,8 +1,8 @@
 """
-Conditional Flow Matching with DiT backbone.
+Conditional Flow Matching with pluggable backbone (DiT or DiffLlama).
 
 Adapted from SoulX-Singer (Amphion) for audio codec reconstruction.
-Uses DiT (Diffusion Transformer) like CosyVoice, compatible with DiffLlama interface.
+Estimator type is selected via `estimator_type` parameter: "dit" (default) or "llama".
 """
 
 import os
@@ -11,9 +11,11 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from dit import DiT
+from llama import DiffLlama
 
 
 class FlowMatchingTransformer(nn.Module):
@@ -37,6 +39,7 @@ class FlowMatchingTransformer(nn.Module):
         sigma=1e-5,
         time_scheduler="cos",
         gradient_checkpointing=False,
+        estimator_type="dit",
     ):
         super().__init__()
 
@@ -46,23 +49,35 @@ class FlowMatchingTransformer(nn.Module):
         self.sigma = sigma
         self.time_scheduler = time_scheduler
         self.cond_scale_factor = cond_scale_factor
+        self.estimator_type = estimator_type
 
         # Condition embedding: cond_dim → hidden_size
         self.cond_emb = nn.Linear(cond_dim, hidden_size)
 
-        # Flow velocity estimator (DiT with cross attention to cond)
-        dim_head = hidden_size // num_heads
-        self.diff_estimator = DiT(
-            mel_dim=mel_dim,
-            cond_dim=hidden_size,
-            dim=hidden_size,
-            depth=num_layers,
-            heads=num_heads,
-            dim_head=dim_head,
-            dropout=0.1,
-            ff_mult=4,
-            gradient_checkpointing=gradient_checkpointing,
-        )
+        # Flow velocity estimator
+        if estimator_type == "dit":
+            dim_head = hidden_size // num_heads
+            self.diff_estimator = DiT(
+                mel_dim=mel_dim,
+                cond_dim=hidden_size,
+                dim=hidden_size,
+                depth=num_layers,
+                heads=num_heads,
+                dim_head=dim_head,
+                dropout=0.1,
+                ff_mult=4,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+        elif estimator_type == "llama":
+            self.diff_estimator = DiffLlama(
+                mel_dim=mel_dim,
+                hidden_size=hidden_size,
+                num_heads=num_heads,
+                num_layers=num_layers,
+                gradient_checkpointing=gradient_checkpointing,
+            )
+        else:
+            raise ValueError(f"Unknown estimator_type: {estimator_type!r}. Use 'dit' or 'llama'.")
 
         self.reset_parameters()
 
@@ -96,6 +111,41 @@ class FlowMatchingTransformer(nn.Module):
                     m.weight.data[m.padding_idx].zero_()
 
         self.apply(_reset_parameters)
+
+    # ------------------------------------------------------------------
+    #  Estimator dispatch
+    # ------------------------------------------------------------------
+
+    def _call_estimator(self, xt, t, cond, x_mask, cond_mask=None):
+        """Dispatch to the underlying estimator, adapting call signature."""
+        if self.estimator_type == "dit":
+            # DiT supports cross attention with different temporal lengths:
+            #   xt:   (B, T_mel, mel_dim)
+            #   cond: (B, T_cond, hidden_size), T_cond can differ from T_mel
+            return self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
+        else:
+            # DiffLlama expects x and cond to share the same time length T.
+            # Our pipeline provides mel at 50 Hz (T_mel) and condition at 25 Hz (T_cond),
+            # same as for DiT cross attention. To keep the *rest* of the system identical
+            # and only swap the estimator, we upsample cond along the time axis to T_mel.
+            #
+            # This makes DiffLlama effectively see a per-frame conditioning sequence,
+            # while leaving the outer architecture (in_proj/post_vq_proj, cond_scale_factor)
+            # unchanged.
+            T_mel = x_mask.shape[1]
+            B, T_cond, H = cond.shape
+            if T_cond != T_mel:
+                cond_upsampled = F.interpolate(
+                    cond.transpose(1, 2),  # (B, H, T_cond)
+                    size=T_mel,
+                    mode="linear",
+                    align_corners=False,
+                ).transpose(1, 2)  # (B, T_mel, H)
+            else:
+                cond_upsampled = cond
+
+            # DiffLlama adds condition internally and does not use cond_mask.
+            return self.diff_estimator(xt, t, cond_upsampled, x_mask)
 
     # ------------------------------------------------------------------
     #  Condition processing
@@ -185,7 +235,7 @@ class FlowMatchingTransformer(nn.Module):
             keep = (torch.rand(x.shape[0], device=x.device) > self.cfg_drop_prob).float()
             cond = cond * keep[:, None, None]
 
-        flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
+        flow_pred = self._call_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
         final_mask = x_mask[..., None]  # (B, T_mel, 1)
 
@@ -238,10 +288,10 @@ class FlowMatchingTransformer(nn.Module):
 
         for i in range(n_timesteps):
             t = (i + 0.5) * h * torch.ones(B, dtype=cond.dtype, device=cond.device)
-            flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
+            flow_pred = self._call_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
             if cfg > 0:
-                uncond_flow_pred = self.diff_estimator(
+                uncond_flow_pred = self._call_estimator(
                     xt, t, torch.zeros_like(cond), x_mask, cond_mask=cond_mask
                 )
                 pos_std = flow_pred.std()
@@ -284,11 +334,11 @@ class FlowMatchingTransformer(nn.Module):
 
         for i in range(n_timesteps):
             t = (i + 0.5) * h * torch.ones(B, dtype=cond.dtype, device=cond.device)
-            flow_pred = self.diff_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
+            flow_pred = self._call_estimator(xt, t, cond, x_mask, cond_mask=cond_mask)
 
             # Classifier-free guidance
             if cfg > 0:
-                uncond_flow_pred = self.diff_estimator(
+                uncond_flow_pred = self._call_estimator(
                     xt, t, torch.zeros_like(cond), x_mask, cond_mask=cond_mask
                 )
                 pos_std = flow_pred.std()

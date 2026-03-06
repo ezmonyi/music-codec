@@ -19,6 +19,7 @@ from utils.train_utils import (
     sync_ddp_ranks_or_break_epoch,
     get_scheduled_vq_weights,
     compute_eval_mel_recon_loss,
+    compute_eval_mcd_cv,
 )
 
 
@@ -43,9 +44,12 @@ class Executor:
     ):
         lr = optimizer.param_groups[0]["lr"]
         logging.info("Epoch {} TRAIN info lr {} rank {}".format(self.epoch, lr, self.rank))
+        effective_bs = info_dict.get("batch_size", 0) * info_dict.get("accum_grad", 1)
         logging.info(
-            "using accumulate grad, new batch size is {} times larger".format(
-                info_dict["accum_grad"]
+            "batch_size={}, accum_grad={}, effective_batch_size={}".format(
+                info_dict.get("batch_size", "?"),
+                info_dict["accum_grad"],
+                effective_bs,
             )
         )
         # Initialize progress bar for rank 0
@@ -155,13 +159,38 @@ class Executor:
                             and writer is not None
                         ):
                             n_steps = info_dict.get("eval_mel_recon_n_steps", 8)
-                            mel_recon = compute_eval_mel_recon_loss(
+                            eval_result = compute_eval_mel_recon_loss(
                                 model, batch_dict, info_dict, n_steps=n_steps
                             )
-                            if mel_recon is not None:
+                            if eval_result is not None:
                                 writer.add_scalar(
-                                    "eval/mel_recon_loss", mel_recon, self.step
+                                    "eval/mel_recon_loss", eval_result["mel_recon_loss"], self.step
                                 )
+                                if "mcd" in eval_result:
+                                    writer.add_scalar(
+                                        "eval/mcd", eval_result["mcd"], self.step
+                                    )
+                        # Eval: MCD on CV set every N steps (TensorBoard)
+                        # All ranks must enter this block together to avoid DDP desync;
+                        # only rank 0 actually runs inference and logs.
+                        mcd_every = info_dict.get("eval_mcd_every_steps", 0)
+                        if (
+                            mcd_every > 0
+                            and self.step % mcd_every == 0
+                            and cv_data_loader is not None
+                        ):
+                            dist.barrier()
+                            if self.rank == 0 and writer is not None:
+                                n_steps = info_dict.get("eval_mel_recon_n_steps", 8)
+                                max_samples = info_dict.get("eval_mcd_max_samples")
+                                mcd_mean = compute_eval_mcd_cv(
+                                    model, cv_data_loader, info_dict,
+                                    n_steps=n_steps,
+                                    max_samples=max_samples,
+                                )
+                                if mcd_mean is not None:
+                                    writer.add_scalar("eval/mcd_mean", mcd_mean, self.step)
+                            dist.barrier()
         
         # Close progress bar and log completion
         if self.rank == 0:

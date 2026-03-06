@@ -55,7 +55,7 @@ def get_args():
     parser.add_argument("--model", default="model", help="model key in config (must match yaml)")
     parser.add_argument("--config", required=True, help="config yaml (hyperpyyaml)")
     parser.add_argument("--local-rank", "--local_rank", help="placeholder for DDP (set by torchrun/launch)")
-    parser.add_argument("--dataset_conf", required=True, help="dataset yaml or manifest path")
+    parser.add_argument("--dataset_conf", default=None, help="dataset yaml or manifest path (optional; dataset_conf in training yaml is used by default)")
     parser.add_argument("--model_dir", required=True, help="save model dir")
     parser.add_argument("--tensorboard_dir", default="tensorboard", help="tensorboard log dir")
     parser.add_argument(
@@ -75,6 +75,7 @@ def get_args():
     parser.add_argument("--num_workers", default=4, type=int, help="dataloader workers")
     parser.add_argument("--prefetch", default=2, type=int, help="prefetch factor")
     parser.add_argument("--pin_memory", action="store_true", default=False)
+    parser.add_argument("--overrides", default=None, help="YAML overrides string prepended to config (e.g. 'estimator_type: llama')")
     args = parser.parse_args()
     return args
 
@@ -93,7 +94,7 @@ def main():
     logging.getLogger("matplotlib").setLevel(logging.WARNING)
 
     with open(args.config, "r") as f:
-        configs = load_hyperpyyaml(f)
+        configs = load_hyperpyyaml(f, overrides=args.overrides)
 
     configs["train_conf"] = configs.get("train_conf", {})
     orig_batch = configs["train_conf"].get("batch_size")
@@ -148,18 +149,23 @@ def main():
     if restore_model_path and os.path.isfile(restore_model_path):
         ckpt = torch.load(restore_model_path, map_location="cpu")
         model_state = model.state_dict()
-        loaded_keys = []
+        loaded_keys, skipped_keys = [], []
         for k, v in ckpt.items():
             if k not in model_state:
+                skipped_keys.append(k)
                 continue
-            # Load only VQ codebook(s): single VQ or RVQ layers
-            if k == "vq_codebook.weight" or k.startswith("rvq.codebooks.") and k.endswith(".weight"):
-                model_state[k] = v
-                loaded_keys.append(k)
+            if model_state[k].shape != v.shape:
+                skipped_keys.append(k)
+                continue
+            model_state[k] = v
+            loaded_keys.append(k)
         model.load_state_dict(model_state, strict=False)
-        print("Restore VQ codebook from {} (encoder kept random init)".format(restore_model_path))
+        print("Restore from {} ({} loaded, {} skipped)".format(
+            restore_model_path, len(loaded_keys), len(skipped_keys)))
         if loaded_keys:
-            print("  Loaded: {}".format(", ".join(loaded_keys[:8]) + ("..." if len(loaded_keys) > 8 else "")))
+            print("  Loaded: {}".format(", ".join(loaded_keys[:10]) + ("..." if len(loaded_keys) > 10 else "")))
+        if skipped_keys:
+            print("  Skipped: {}".format(", ".join(skipped_keys[:10]) + ("..." if len(skipped_keys) > 10 else "")))
 
     model = wrap_cuda_model(args, model)
 
@@ -186,8 +192,42 @@ def main():
     print("last_step: {}, last_epoch: {}".format(last_step, last_epoch))
 
     info_dict = deepcopy(configs["train_conf"])
+    # Expose dataset statistics (e.g., mel mean/std) to training loop via info_dict
+    # so that batch_forward can normalize mel before FM noising / loss.
+    if "stat" in configs and isinstance(configs["stat"], dict):
+        info_dict.update(configs["stat"])
     info_dict["step"] = last_step
     info_dict["epoch"] = last_epoch
+
+    # Load EAR_VAE for earvae_latent mode (encode waveform -> latent on GPU)
+    ear_vae_conf = configs.get("ear_vae")
+    if ear_vae_conf is not None:
+        source_dir = ear_vae_conf.get("source_dir")
+        if source_dir and source_dir not in sys.path:
+            sys.path.insert(0, source_dir)
+        try:
+            from huggingface_hub import hf_hub_download
+        except ImportError as e:
+            raise ImportError("ear_vae requires huggingface_hub; pip install huggingface_hub") from e
+        import json as _json
+        config_path = os.path.join(source_dir or ".", ear_vae_conf.get("config_json", "config/ear_vae_v2.json"))
+        with open(config_path, "r") as f:
+            vae_config = _json.load(f)
+        ckpt_path = hf_hub_download(
+            repo_id=ear_vae_conf.get("hf_repo", "earlab/EAR_VAE"),
+            filename=ear_vae_conf.get("hf_filename", "pretrained_weight/ear_vae_v2_48k.pyt"),
+        )
+        from model.ear_vae import EAR_VAE
+        ear_vae = EAR_VAE(model_config=vae_config)
+        ear_vae.load_state_dict(torch.load(ckpt_path, map_location="cpu"))
+        ear_vae.eval()
+        for p in ear_vae.parameters():
+            p.requires_grad = False
+        ear_vae.cuda()
+        info_dict["ear_vae_model"] = ear_vae
+        info_dict["ear_vae_downsample_ratio"] = int(ear_vae_conf.get("downsampling_ratio", 960))
+        if rank == 0:
+            logging.info(f"[Rank {rank}] Loaded EAR_VAE from {ckpt_path}")
 
     save_model_opt(model, optimizer, "init", info_dict)
 
